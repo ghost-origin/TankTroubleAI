@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, minimum-scale=1.0, user-scalable=no, minimal-ui">
+    <title>坦克动荡 3 — 本地版</title>
+    <style type="text/css">
+        * { padding: 0; margin: 0; box-sizing: border-box; }
+        html, body {
+            background: #111;
+            color: #fff;
+            height: 100%;
+            overflow: hidden;
+            touch-action: none;
+            -ms-touch-action: none;
+            font-family: "Segoe UI", "Microsoft YaHei", Arial, sans-serif;
+        }
+        body { display: flex; flex-direction: column; align-items: center; justify-content: center; }
+        #bar {
+            width: 100%;
+            text-align: center;
+            padding: 6px 0;
+            font-size: 13px;
+            color: #9aa;
+            background: #181820;
+            border-bottom: 1px solid #2a2a35;
+            user-select: none;
+        }
+        #bar b { color: #cfd; }
+        #c2canvasdiv {
+            flex: 1;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            width: 100%;
+        }
+        canvas {
+            background: #000;
+            touch-action: none;
+            -ms-touch-action: none;
+            max-width: 100vw;
+            max-height: 100%;
+        }
+        #errbox {
+            display: none;
+            position: fixed;
+            top: 0; left: 0; right: 0;
+            background: #7a1f1f;
+            color: #ffe0e0;
+            font: 12px/1.5 Consolas, monospace;
+            padding: 8px 12px;
+            white-space: pre-wrap;
+            word-break: break-all;
+            z-index: 9999;
+        }
+    </style>
+</head>
+<body>
+    <div id="errbox"></div>
+    <div id="bar"><b>坦克动荡 3（本地离线版）</b> &nbsp;·&nbsp; 操作：WASD/方向键 移动 · 鼠标瞄准 · 左键开火</div>
+    <div id="c2canvasdiv">
+        <canvas id="c2canvas" width="965" height="644"></canvas>
+    </div>
+
+    <script>
+        // 把运行期错误直接显示在页面上，方便排查（黑屏时能看到原因）
+        window.addEventListener('error', function (e) {
+            var box = document.getElementById('errbox');
+            box.style.display = 'block';
+            box.textContent = 'JS 错误: ' + (e.message || e.type) + (e.filename ? '\n' + e.filename + ':' + e.lineno : '');
+        });
+        window.addEventListener('unhandledrejection', function (e) {
+            var box = document.getElementById('errbox');
+            box.style.display = 'block';
+            box.textContent = '未处理的 Promise 错误: ' + (e.reason && e.reason.message ? e.reason.message : e.reason);
+        });
+    </script>
+
+    <script src="jquery-2.1.1.min.js"></script>
+    <script src="ga_init.js"></script>
+    <script src="firebase.js"></script>
+    <script src="pathfind.js"></script>
+    <script src="c2runtime.js"></script>
+
+    <script>
+        // 启动游戏（原网页由官方加载器 playgame.js 调用，这里显式补上）
+        jQuery(document).ready(function () {
+            cr_createRuntime("c2canvas");
+        });
+    </script>
+</body>
+</html>
