@@ -11,15 +11,17 @@ import json
 import os
 import socket
 import socketserver
+import subprocess
 import sys
 import time
 import webbrowser
 
-BASE_FILE = os.path.join("src", "data.js.base")  # 纯净原版游戏数据（不要改）
+BASE_FILE = os.path.join("src", "tanktrouble", "data.js.base")  # 纯净原版游戏数据（不要改）
 CONFIG_FILE = os.path.join("config", "config.json")  # 玩家配置文件（可以随便改）
-OUT_FILE = os.path.join("src", "data.js")  # 生成的游戏数据（每次启动/配置变更时重新生成）
+OUT_FILE = os.path.join("src", "tanktrouble", "data.js")  # 生成的游戏数据（每次启动/配置变更时重新生成）
 SRC_DIR = "src"      # 游戏运行文件所在目录（相对页面加载）
-ASSETS_PREFIX = "../assets/"  # 贴图/音效等资源目录（相对 src/ 页面）
+ASSETS_PREFIX = "../../assets/"  # 贴图/音效等资源目录（相对 src/tanktrouble/ 页面）
+AI_SERVER = os.path.join("data log", "record_ws.py")  # 数据记录服务（桥 → GameState → CSV）
 
 DEFAULT_CONFIG = {
     "子弹速度倍率": 1.0,      # 普通/大/小/直线子弹的发射冲量倍率
@@ -79,6 +81,9 @@ REF_IMPULSE = 228          # Physics.ApplyImpulseAtAngle
 REF_COMPARE = 94           # System.Compare（用于 TotalTime 寿命阈值）
 REF_EVERY = 123            # System.Every
 REF_CREATE = 121           # System.CreateObject
+REF_WAIT = 68              # System.Wait
+REF_PATH_FAIL = 138        # Pathfinding.OnFailedToFindPath
+REF_FINDPATH = 134         # Pathfinding.FindPath
 POWERUP_TYPE = 40          # 道具对象类型
 
 def patch_data(data, cfg):
@@ -155,6 +160,23 @@ def patch_data(data, cfg):
                 pass
     walk(data, patch_respawn)
 
+    # 7) 修复游戏 BUG：OnFailedToFindPath -> FindPath 同步重试会无限递归爆栈
+    #    （寻路持续失败时，失败回调里触发的事件又同步调 FindPath → 栈溢出）。
+    #    在重试 FindPath 前插入 Wait(0.5) 动作，把重试变为异步。
+    _wait_sid = 9000000000000010
+    def patch_pathfail(arr):
+        nonlocal _wait_sid
+        if (len(arr) >= 7 and arr[0] == 0 and isinstance(arr[5], list) and isinstance(arr[6], list)
+                and any(isinstance(c, list) and c[1] == REF_PATH_FAIL for c in arr[5])
+                and any(isinstance(a, list) and a[1] == REF_FINDPATH for a in arr[6])):
+            # 已有 Wait 则跳过（幂等）
+            if any(isinstance(a, list) and a[1] == REF_WAIT for a in arr[6]):
+                return
+            idx = next(i for i, a in enumerate(arr[6]) if isinstance(a, list) and a[1] == REF_FINDPATH)
+            _wait_sid += 1
+            arr[6].insert(idx, [-1, REF_WAIT, None, _wait_sid, False, [[0, [0, 0.5]]]])
+    walk(data, patch_pathfail)
+
     return data
 
 def rewrite_media_paths(obj):
@@ -196,7 +218,7 @@ def build_data(cfg):
     # files_subfolder：引擎播放/预载音频时拼路径用（file 基名 + ".ogg"/".m4a"），
     # 原版为空字符串（媒体在页面根目录）；重组后音频在 assets/，这里指向它
     try:
-        data["project"][8] = "../assets/"
+        data["project"][8] = "../../assets/"
     except Exception:
         pass
     rewrite_media_paths(data)
@@ -225,6 +247,8 @@ def get_patched_data():
     return _cache["blob"]
 
 # ---- HTTP 服务 ----
+_AI_PORT = None  # 由 main() 设置，供 /ai-port 接口返回
+
 class GameHandler(http.server.SimpleHTTPRequestHandler):
     def log_message(self, format, *args):
         sys.stdout.write("[%s] %s\n" % (self.log_date_time_string(), format % args))
@@ -233,10 +257,20 @@ class GameHandler(http.server.SimpleHTTPRequestHandler):
     def do_GET(self):
         path = self.path.split("?")[0]
         if path in ("/", ""):
-            # 根路径 -> 游戏入口（src 目录）
+            # 根路径 -> 游戏入口
             self.send_response(302)
-            self.send_header("Location", "/src/")
+            self.send_header("Location", "/src/tanktrouble/")
             self.end_headers()
+            return
+        if path == "/ai-port":
+            # 页面桥接脚本通过这里获取 AI 服务端口
+            blob = json.dumps({"port": _AI_PORT}).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(blob)))
+            self.end_headers()
+            self.wfile.write(blob)
             return
         if path.endswith("/data.js"):
             blob = get_patched_data()
@@ -258,8 +292,24 @@ def main():
     os.chdir(os.path.dirname(os.path.abspath(__file__)))
     cfg = load_config()
     port = find_free_port()
+
+    # 启动 Python AI 桥接服务（WebSocket），端口通过 /ai-port 暴露给页面
+    global _AI_PORT
+    ai_proc = None
+    if os.path.exists(AI_SERVER):
+        try:
+            _AI_PORT = find_free_port()
+            ai_proc = subprocess.Popen(
+                [sys.executable, AI_SERVER, str(_AI_PORT)],
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            print("  数据记录服务已启动: ws://127.0.0.1:%d/ai（写入 data log/）" % _AI_PORT)
+        except Exception as e:
+            print("  AI 桥接服务启动失败（游戏仍可玩，AI 功能不可用）: %s" % e)
+            _AI_PORT = None
+
     httpd = socketserver.TCPServer(("127.0.0.1", port), GameHandler)
-    url = "http://127.0.0.1:%d/src/" % port
+    url = "http://127.0.0.1:%d/src/tanktrouble/" % port
     print("=" * 54)
     print("  坦克动荡 3 本地版已启动")
     print("  游戏地址: %s" % url)
@@ -278,6 +328,11 @@ def main():
         pass
     finally:
         httpd.server_close()
+        if ai_proc:
+            try:
+                ai_proc.terminate()
+            except Exception:
+                pass
 
 if __name__ == "__main__":
     main()
