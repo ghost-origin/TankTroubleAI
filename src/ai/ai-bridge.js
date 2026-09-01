@@ -86,9 +86,12 @@
             out.foe = {
                 x: +foe.x.toFixed(1), y: +foe.y.toFixed(1),
                 angle: +foe.angle.toFixed(3), aim: +foe.angle.toFixed(3),
-                vx: 0, vy: 0
+                vx: 0, vy: 0,
+                // 敌方当前动画名：击杀瞬间变 "explosion"，可用作"本局结束"信号
+                anim: foe.cur_animation ? foe.cur_animation.name : ''
             };
         }
+        out.me.anim = me.cur_animation ? me.cur_animation.name : '';
         // 速度：位置差分（游戏时间）
         var dt = (lastT !== null && t > lastT) ? (t - lastT) : 0;
         for (var key in out) {
