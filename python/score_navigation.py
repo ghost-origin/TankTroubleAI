@@ -14,10 +14,10 @@ but it is no longer the core path score.
 from __future__ import annotations
 import argparse, csv, glob, math, os, json
 import numpy as np
-from scipy.ndimage import distance_transform_edt
 from navigation_mvp import (
     load_maze, load_polys, build_maps,
     point_to_cell, cell_to_point, nearest_free, astar,
+    distance_transform_edt,
 )
 
 MAX_FRAME_GAP_S = 2.0
@@ -29,7 +29,18 @@ MAP_EFF_WINDOW_S = 1.0
 
 def load(path):
     with open(path, newline='', encoding='utf-8-sig') as f:
-        return [{k:float(v) for k,v in r.items() if v!=''} for r in csv.DictReader(f)]
+        rows = []
+        for r in csv.DictReader(f):
+            out = {}
+            for k, v in r.items():
+                if v == '':
+                    continue
+                try:
+                    out[k] = float(v)
+                except ValueError:
+                    out[k] = v  # 非数值列（如 controller_mode）原样保留
+            rows.append(out)
+        return rows
 
 
 def validate_single_round(rows):
@@ -168,6 +179,23 @@ def trajectory_metrics(rows, prefix, raw_wall, blocked):
 
     map_eff, map_windows = map_path_efficiency(rows, prefix, blocked)
 
+    # Explicit behavior statistics requested by the navigation benchmark.
+    duration_s = max(0.0, float(rows[-1]['t']) - float(rows[0]['t'])) if len(rows) >= 2 else 0.0
+    average_speed = L / duration_s if duration_s > 1e-9 else 0.0
+    moving_t = 0.0
+    moving_d = 0.0
+    for a, b in zip(rows, rows[1:]):
+        dt = max(0.0, float(b['t']) - float(a['t']))
+        if dt <= 1e-9:
+            continue
+        d = math.hypot(float(b[prefix+'_x'])-float(a[prefix+'_x']),
+                       float(b[prefix+'_y'])-float(a[prefix+'_y']))
+        if d / dt >= 5.0:
+            moving_t += dt
+            moving_d += d
+    moving_speed = moving_d / moving_t if moving_t > 1e-9 else 0.0
+    idle_ratio = 1.0 - moving_t / duration_s if duration_s > 1e-9 else 1.0
+
     dist = distance_transform_edt(~raw_wall)
     clear = []
     overlap = []
@@ -185,6 +213,11 @@ def trajectory_metrics(rows, prefix, raw_wall, blocked):
 
     return dict(
         path_px=L,
+        total_distance_px=L,
+        duration_s=duration_s,
+        average_speed_px_s=average_speed,
+        moving_speed_px_s=moving_speed,
+        idle_ratio=idle_ratio,
         smooth_rad_per_100px=smooth100,
         map_path_efficiency=map_eff,
         map_efficiency_windows=float(map_windows),
@@ -210,6 +243,7 @@ def relative(ours, ai):
         'safety_score': 1.0,
         'near_wall_diagnostic_score': (1.0+ai['near_wall_8_ratio'])/(1.0+ours['near_wall_8_ratio']),
         'legacy_local_path_score': ours['local_efficiency']/max(ai['local_efficiency'],1e-9),
+        'average_speed_score': ours['average_speed_px_s']/max(ai['average_speed_px_s'],1e-9),
     }
 
 
@@ -260,7 +294,7 @@ def main():
         foe_all.append(fm)
         per.append((os.path.basename(track), mm, fm))
 
-    fields = ['file','actor','path_px','smooth_rad_per_100px','map_path_efficiency',
+    fields = ['file','actor','path_px','total_distance_px','duration_s','average_speed_px_s','moving_speed_px_s','idle_ratio','smooth_rad_per_100px','map_path_efficiency',
               'map_efficiency_windows','local_efficiency','min_clearance_px',
               'near_wall_8_ratio','near_wall_12_ratio','wall_overlap_ratio']
     with open(a.out, 'w', newline='', encoding='utf-8-sig') as f:
@@ -282,7 +316,7 @@ def main():
 
     paired_out = a.paired_out or os.path.splitext(a.out)[0] + '_paired.csv'
     paired_fields = ['file','path_score','smooth_score','safety_score','composite_score',
-                     'near_wall_diagnostic_score','legacy_local_path_score']
+                     'near_wall_diagnostic_score','legacy_local_path_score','average_speed_score']
     with open(paired_out, 'w', newline='', encoding='utf-8-sig') as f:
         w = csv.DictWriter(f, fieldnames=paired_fields)
         w.writeheader()
@@ -299,6 +333,7 @@ def main():
             'path': 'map-aware A* shortest feasible distance / actual distance, ~1s windows',
             'smooth': 'heading-change radians per 100px; lower is better',
             'safety': 'hard gate: any wall overlap/collision proxy rejects match; valid match safety_score=1',
+            'distance_speed': 'total_distance_px and average_speed_px_s are reported as explicit behavior metrics; speed is diagnostic and is not yet added to composite weighting',
             'baseline': 'existing_ai = 1.0',
         },
         'n_candidate_tracks': len(per) + len(skipped),
