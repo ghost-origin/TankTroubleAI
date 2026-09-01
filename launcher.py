@@ -6,6 +6,7 @@
 - 自动寻找空闲端口，绑定 127.0.0.1（绕开 localhost 的 IPv6 坑）
 - 自动打开浏览器；关闭本窗口或按 Ctrl+C 即停止
 """
+import argparse
 import http.server
 import json
 import os
@@ -21,7 +22,57 @@ CONFIG_FILE = os.path.join("config", "config.json")  # 玩家配置文件（可�
 OUT_FILE = os.path.join("src", "tanktrouble", "data.js")  # 生成的游戏数据（每次启动/配置变更时重新生成）
 SRC_DIR = "src"      # 游戏运行文件所在目录（相对页面加载）
 ASSETS_PREFIX = "../../assets/"  # 贴图/音效等资源目录（相对 src/tanktrouble/ 页面）
-AI_SERVER = os.path.join("data log", "record_ws.py")  # 数据记录服务（桥 → GameState → CSV）
+RECORD_SERVER = os.path.join("data log", "record_ws.py")  # 原始数据记录服务
+NAV_SERVER = os.path.join("python", "navigation_bot.py")     # 最新导航 AI WebSocket 服务
+
+
+def find_numpy_python():
+    """找一个能 import numpy 的 Python 解释器（导航 bot 依赖 numpy）。
+
+    顺序：当前解释器 -> python -> python3 -> py launcher -> 常见 conda 路径
+    （用户目录 anaconda3/miniconda3 + 各盘符根 anaconda/miniconda）。
+    为避免导航 bot 因缺 numpy 启动崩溃（网页桥连不上 AI 的根因），
+    导航模式优先用它；找不到时回退 sys.executable（bot 会报错，游戏仍可玩）。
+    """
+    import shutil
+
+    candidates = []
+    # 当前解释器先试（最可能匹配环境）
+    candidates.append(sys.executable)
+    for name in ("python", "python3", "py"):
+        p = shutil.which(name)
+        if p and p not in candidates:
+            candidates.append(p)
+    # 常见 conda 安装路径：用户目录 + 各盘符根
+    conda_roots = []
+    for base in (os.path.expanduser("~/anaconda3"), os.path.expanduser("~/miniconda3"),
+                 os.path.expanduser("~/Anaconda3"), os.path.expanduser("~/Miniconda3")):
+        conda_roots.append(base)
+    for drive in ("C", "D", "E", "F", "G"):
+        conda_roots.append("%s:\\anaconda3" % drive)
+        conda_roots.append("%s:\\miniconda3" % drive)
+        conda_roots.append("%s:\\anaconda" % drive)
+        conda_roots.append("%s:\\miniconda" % drive)
+    for base in conda_roots:
+        for sub in ("python.exe", "bin/python"):
+            p = os.path.join(base, sub)
+            if os.path.exists(p):
+                candidates.append(p)
+    # 去重（大小写不敏感）后逐个试探
+    seen = set()
+    for p in candidates:
+        key = os.path.normcase(os.path.abspath(p))
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            r = subprocess.run([p, "-c", "import numpy"],
+                               capture_output=True, timeout=15)
+            if r.returncode == 0:
+                return p
+        except Exception:
+            continue
+    return sys.executable   # 兜底：找不到也启动，靠报错提示
 
 DEFAULT_CONFIG = {
     "子弹速度倍率": 1.0,      # 普通/大/小/直线子弹的发射冲量倍率
@@ -289,39 +340,80 @@ def find_free_port():
         return s.getsockname()[1]
 
 def main():
-    os.chdir(os.path.dirname(os.path.abspath(__file__)))
+    parser = argparse.ArgumentParser(description="TankTrouble 本地网页启动器")
+    parser.add_argument(
+        "--ai-mode", choices=("record", "navigation", "none"), default="record",
+        help="record=原始数据记录；navigation=最新导航AI控制绿色坦克；none=不启用WebSocket服务"
+    )
+    parser.add_argument("--no-browser", action="store_true", help="只启动服务，不自动打开浏览器")
+    parser.add_argument("--nav-log-dir", default="web_nav_logs", help="navigation 模式日志输出目录")
+    args = parser.parse_args()
+
+    repo_root = os.path.dirname(os.path.abspath(__file__))
+    os.chdir(repo_root)
     cfg = load_config()
     port = find_free_port()
 
-    # 启动 Python AI 桥接服务（WebSocket），端口通过 /ai-port 暴露给页面
+    # 启动 Python WebSocket 服务，端口通过 /ai-port 暴露给网页中的 ai-bridge.js。
+    # 网页与无头模式共用同一套 bridge/action 协议。
     global _AI_PORT
     ai_proc = None
-    if os.path.exists(AI_SERVER):
+    if args.ai_mode != "none":
         try:
             _AI_PORT = find_free_port()
+            if args.ai_mode == "navigation":
+                nav_log_dir = os.path.abspath(args.nav_log_dir)
+                os.makedirs(nav_log_dir, exist_ok=True)
+                # 导航 bot 依赖 numpy：用能找到 numpy 的解释器启动，
+                # 否则 bot 启动即崩、网页桥连不上（红色"AI未连接"预警的根因）。
+                bot_py = find_numpy_python()
+                if bot_py != sys.executable:
+                    print("  导航 AI 使用解释器: %s（当前 %s 无 numpy）" % (bot_py, sys.executable))
+                cmd = [
+                    bot_py, NAV_SERVER,
+                    "--port", str(_AI_PORT),
+                    "--out-dir", nav_log_dir,
+                    "--repo", repo_root,
+                ]
+                label = "导航 AI"
+                where = nav_log_dir
+            else:
+                record_dir = os.path.abspath("data log")
+                cmd = [sys.executable, RECORD_SERVER, str(_AI_PORT), record_dir]
+                label = "数据记录"
+                where = record_dir
+
             ai_proc = subprocess.Popen(
-                [sys.executable, AI_SERVER, str(_AI_PORT)],
+                cmd,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
-            print("  数据记录服务已启动: ws://127.0.0.1:%d/ai（写入 data log/）" % _AI_PORT)
+            print("  %s服务已启动: ws://127.0.0.1:%d/ai" % (label, _AI_PORT))
+            print("  日志目录: %s" % where)
         except Exception as e:
-            print("  AI 桥接服务启动失败（游戏仍可玩，AI 功能不可用）: %s" % e)
+            print("  WebSocket 服务启动失败（网页游戏仍可打开）: %s" % e)
             _AI_PORT = None
+    else:
+        _AI_PORT = None
+        print("  AI/WebSocket 服务: 未启用")
 
+    # allow quick restart after Ctrl+C
+    socketserver.TCPServer.allow_reuse_address = True
     httpd = socketserver.TCPServer(("127.0.0.1", port), GameHandler)
     url = "http://127.0.0.1:%d/src/tanktrouble/" % port
     print("=" * 54)
-    print("  坦克动荡 3 本地版已启动")
+    print("  坦克动荡 3 网页版已启动")
     print("  游戏地址: %s" % url)
+    print("  WebSocket 模式: %s" % args.ai_mode)
     print("  当前配置（config.json，改后刷新浏览器即生效）：")
     for k, v in cfg.items():
         print("    %s = %s" % (k, v))
     print("  关闭本窗口或按 Ctrl+C 即停止游戏服务")
     print("=" * 54)
-    try:
-        webbrowser.open(url)
-    except Exception:
-        pass
+    if not args.no_browser:
+        try:
+            webbrowser.open(url)
+        except Exception:
+            pass
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
