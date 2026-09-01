@@ -37,7 +37,15 @@ def load(csv_path):
     rows = []
     with open(csv_path, newline="", encoding="utf-8") as f:
         for r in csv.DictReader(f):
-            rows.append({k: float(v) for k, v in r.items() if v})
+            out = {}
+            for k, v in r.items():
+                if not v:
+                    continue
+                try:
+                    out[k] = float(v)
+                except ValueError:
+                    out[k] = v  # 非数值列（如 controller_mode）原样保留
+            rows.append(out)
     return rows
 
 
@@ -124,16 +132,17 @@ def plot(csv_path, rows):
     fig, ax = plt.subplots(figsize=(9, 6.5))
     draw_maze(ax, walls, polys)   # 先画墙线（底层）
 
-    # 我方轨迹（蓝）
-    ax.plot(me_x, me_y, "-", color="#1f77b4", lw=1.4, alpha=0.9, label="Me (blue)", zorder=3)
-    # 敌方轨迹（红）
-    ax.plot(foe_x, foe_y, "-", color="#d62728", lw=1.4, alpha=0.9, label="Foe (red)", zorder=3)
+    if rows:
+        # 我方轨迹（蓝）
+        ax.plot(me_x, me_y, "-", color="#1f77b4", lw=1.4, alpha=0.9, label="Me (blue)", zorder=3)
+        # 敌方轨迹（红）
+        ax.plot(foe_x, foe_y, "-", color="#d62728", lw=1.4, alpha=0.9, label="Foe (red)", zorder=3)
 
-    # 起点/终点标记
-    ax.plot(me_x[0], me_y[0], "o", color="#1f77b4", ms=7, label="Me start", zorder=4)
-    ax.plot(me_x[-1], me_y[-1], "s", color="#1f77b4", ms=7, label="Me end", zorder=4)
-    ax.plot(foe_x[0], foe_y[0], "o", color="#d62728", ms=7, label="Foe start", zorder=4)
-    ax.plot(foe_x[-1], foe_y[-1], "s", color="#d62728", ms=7, label="Foe end", zorder=4)
+        # 起点/终点标记
+        ax.plot(me_x[0], me_y[0], "o", color="#1f77b4", ms=7, label="Me start", zorder=4)
+        ax.plot(me_x[-1], me_y[-1], "s", color="#1f77b4", ms=7, label="Me end", zorder=4)
+        ax.plot(foe_x[0], foe_y[0], "o", color="#d62728", ms=7, label="Foe start", zorder=4)
+        ax.plot(foe_x[-1], foe_y[-1], "s", color="#d62728", ms=7, label="Foe end", zorder=4)
 
     # 迷宫区域边框
     ax.add_patch(plt.Rectangle((0, 0), MAZE_SIZE * TILE_PX, MAZE_SIZE * TILE_PX,
@@ -145,9 +154,11 @@ def plot(csv_path, rows):
     ax.set_xlabel("x (px, map origin at top-left)")
     ax.set_ylabel("y (px, map origin at top-left)")
     maze_note = (" | 迷宫 %d 墙块" % len(walls)) if walls else " | 无迷宫数据"
+    duration = rows[-1]["t"] - rows[0]["t"] if rows else 0.0
     ax.set_title("Tank tracks  %s\n%d frames, %.1fs%s" % (
-        os.path.basename(csv_path), len(rows), rows[-1]["t"] - rows[0]["t"], maze_note))
-    ax.legend(loc="upper right", fontsize=8)
+        os.path.basename(csv_path), len(rows), duration, maze_note))
+    if rows:
+        ax.legend(loc="upper right", fontsize=8)
     ax.grid(False)
 
     # 限制显示范围：迷宫区 + 一点外边距

@@ -60,7 +60,12 @@ class WSClient:
                 elif opcode == 0x9:    # ping -> pong
                     self._send_frame(payload, 0xA)
                 elif opcode == 0x1:    # text
-                    self.on_message(payload.decode("utf-8", "replace"))
+                    try:
+                        self.on_message(payload.decode("utf-8", "replace"))
+                    except Exception:
+                        # 单条消息出错只丢弃该消息，绝不杀连接（消息处理方自带护栏）
+                        import traceback
+                        traceback.print_exc()
         except Exception:
             pass
         finally:
@@ -106,7 +111,11 @@ class WSServer:
             try:
                 conn, addr = self.sock.accept()
             except OSError:
-                break
+                # accept 瞬态错误（连接重置等）绝不能终止服务 —— 否则 bot
+                # 进程退出、launcher 重启，造成"时好时坏"的 2-3s 高延迟。
+                continue
+            except Exception:
+                continue
             threading.Thread(target=self._handle, args=(conn, addr), daemon=True).start()
 
     def _handle(self, conn, addr):

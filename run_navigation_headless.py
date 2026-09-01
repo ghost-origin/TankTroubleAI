@@ -9,7 +9,17 @@ For navigation-only evaluation pass --navigation-only. This disables firing so
 combat deaths do not dominate the path-planning benchmark.
 """
 from __future__ import annotations
-import argparse, glob, os, signal, subprocess, sys, time
+import argparse, glob, os, signal, socket, subprocess, sys, time
+
+
+def pick_free_port():
+    """Ephemeral loopback port; per-match use avoids lingering exclusive binds."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.bind(('127.0.0.1', 0))
+        return s.getsockname()[1]
+    finally:
+        s.close()
 
 
 def newest(pattern, before=None):
@@ -42,11 +52,17 @@ def main():
     ap=argparse.ArgumentParser()
     ap.add_argument('--repo',default=os.getcwd())
     ap.add_argument('--matches',type=int,default=10)
-    ap.add_argument('--port',type=int,default=8766)
-    ap.add_argument('--duration',type=float,default=20)
+    ap.add_argument('--port',type=int,default=0,
+                    help='fixed WS port (0 = per-match ephemeral)')
+    ap.add_argument('--duration',type=float,default=60,
+                    help='standard round length in game-seconds (safety cap)')
     ap.add_argument('--out',default='nav_headless_results')
     ap.add_argument('--engine',choices=['auto','jsdom','chromium'],default='auto')
     ap.add_argument('--navigation-only',action='store_true')
+    ap.add_argument('--tactical-mode',choices=['rear_only','tactical_v1','chase'],default='chase',
+                    help='OODA target policy; chase targets foe position (default); rear_only is the legacy baseline')
+    ap.add_argument('--prediction-horizon-s',type=float,default=0.0,
+                    help='Kalman foe prediction horizon; use 0 for baseline A/B')
     ap.add_argument('--seed-base',type=int,default=0,
                     help='Chromium deterministic seed base; match i uses seed_base+i')
     ap.add_argument('--game-speed',type=float,default=1.0)
@@ -60,7 +76,8 @@ def main():
         engine='jsdom' if have_jsdom() else 'chromium'
     if engine=='jsdom' and not have_jsdom():
         raise SystemExit('jsdom engine requested but JSDOM_PATH/node_modules/jsdom is missing')
-    print('engine:',engine,'navigation_only:',a.navigation_only,'matches:',a.matches,flush=True)
+    print('engine:',engine,'navigation_only:',a.navigation_only,'tactical_mode:',a.tactical_mode,
+          'prediction_horizon_s:',a.prediction_horizon_s,'matches:',a.matches,flush=True)
 
     bot=os.path.join(repo,'python','navigation_bot.py')
     jsrunner=os.path.join(repo,'data log','run_match.js')
@@ -73,17 +90,21 @@ def main():
     for i in range(a.matches):
         rd=os.path.join(out,'match_%03d'%(i+1)); os.makedirs(rd,exist_ok=True)
         t0=time.time()
-        print('\n=== match %d/%d ==='%(i+1,a.matches),flush=True)
+        port = a.port if a.port else pick_free_port()
+        print('\n=== match %d/%d === (port %d)'%(i+1,a.matches,port),flush=True)
         bot_log=open(os.path.join(rd,'bot.log'),'w',encoding='utf-8')
-        bp=subprocess.Popen([sys.executable,bot,'--port',str(a.port),'--out-dir',rd,'--repo',repo],
+        bp=subprocess.Popen([sys.executable,bot,'--port',str(port),'--out-dir',rd,'--repo',repo,
+                             '--tactical-mode',a.tactical_mode,
+                             '--prediction-horizon-s',str(a.prediction_horizon_s),
+                             '--exit-on-round-end'],
                             cwd=repo,stdout=bot_log,stderr=subprocess.STDOUT)
         time.sleep(0.6)
         try:
             if engine=='jsdom':
-                cmd=['node',jsrunner,str(a.port),str(a.duration)]
+                cmd=['node',jsrunner,str(port),str(a.duration)]
                 if a.navigation_only: cmd.append('nav-only')
             else:
-                cmd=[sys.executable,chr_runner,str(a.port),str(a.duration),'--repo',repo,
+                cmd=[sys.executable,chr_runner,str(port),str(a.duration),'--repo',repo,
                      '--game-speed',str(a.game_speed)]
                 if a.navigation_only: cmd.append('--no-firing')
                 if a.seed_base: cmd += ['--seed',str(a.seed_base+i+1)]
@@ -93,10 +114,37 @@ def main():
                 popen_kw=dict(cwd=repo,env=os.environ.copy(),stdout=rf,stderr=subprocess.STDOUT)
                 if os.name != 'nt': popen_kw['start_new_session']=True
                 rp=subprocess.Popen(cmd,**popen_kw)
+                deadline = time.time() + max(35, int(a.duration) + 20)
+                rc = None
+                flag_path = os.path.join(rd, 'round_end.flag')
                 try:
-                    rc=rp.wait(timeout=max(35,int(a.duration)+20))
+                    while time.time() < deadline:
+                        # bot 判定的局终 → 主动退出 → 该场结束（一次比赛=一局）
+                        if bp.poll() is not None:
+                            if os.path.exists(flag_path):
+                                with open(flag_path, encoding='utf-8') as ff:
+                                    print('bot ended round: %s' % ff.read().strip(), flush=True)
+                            else:
+                                print('WARN: bot exited without round_end.flag', flush=True)
+                            try:
+                                rc = rp.wait(timeout=6)
+                            except subprocess.TimeoutExpired:
+                                kill_process_tree(rp)
+                                rc = 124
+                            break
+                        try:
+                            rc = rp.wait(timeout=0.5)
+                            break
+                        except subprocess.TimeoutExpired:
+                            continue
                 except subprocess.TimeoutExpired:
-                    rc=124
+                    rc = 124
+                    kill_process_tree(rp)
+                    try: rp.wait(timeout=3)
+                    except Exception: pass
+                    print('runner hard-timeout; process tree killed',flush=True)
+                if rc is None:
+                    rc = 124
                     kill_process_tree(rp)
                     try: rp.wait(timeout=3)
                     except Exception: pass

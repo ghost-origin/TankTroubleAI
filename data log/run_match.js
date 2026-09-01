@@ -16,6 +16,7 @@ const { JSDOM, VirtualConsole } = require(process.env.JSDOM_PATH + '/node_module
 
 const REC_PORT = parseInt(process.argv[2] || '8766', 10);
 const DURATION = parseFloat(process.argv[3] || '90');
+const DIAG = !!process.env.DIAG;
 
 const ROOT = path.join(__dirname, '..');
 const GAME_DIR = path.join(ROOT, 'src', 'tanktrouble');
@@ -23,7 +24,7 @@ const BRIDGE = fs.readFileSync(path.join(ROOT, 'src', 'ai', 'ai-bridge.js'), 'ut
 
 function bootGame() {
   const vc = new VirtualConsole();
-  vc.on('log', () => {});
+  vc.on('log', function () { console.log('[js]', Array.prototype.join.call(arguments, ' ')); });
   vc.on('error', () => {});
   const dom = new JSDOM(
     '<!DOCTYPE html><html><head><script></script></head><body><div id="c2canvasdiv"><canvas id="c2canvas" width="965" height="644"></canvas></div></body></html>',
@@ -82,17 +83,54 @@ function bootGame() {
   );
   const oc = rt.areAllTexturesAndSoundsLoaded.bind(rt);
   rt.areAllTexturesAndSoundsLoaded = function () { const sv = this.preloadSounds; this.preloadSounds = false; const r = oc(); this.preloadSounds = sv; return r; };
+  // 时间倍率：8x 时物理 dt=8/60，坦克每 tick 位移 ~16.7px，薄墙(4-6px)会被
+  // 离散碰撞直接跨越（隧道穿墙）。降到 2x：步长 ~4.2px < 墙厚，穿墙消失。
+  const TIME_SCALE = 2;
   const oa = rt.kahanTime.add.bind(rt.kahanTime);
-  rt.kahanTime.add = dt => oa(dt * 8);
+  rt.kahanTime.add = dt => oa(dt * TIME_SCALE);
   const og = rt.getDt ? rt.getDt.bind(rt) : null;
-  if (og) rt.getDt = inst => og(inst) * 8;
-  return { dom, window, rt };
+  if (og) rt.getDt = inst => og(inst) * TIME_SCALE;
+  return { dom, window, rt, ctx };
+}
+
+function diagLog(rt, ctx) {
+  const me0 = rt.types_by_index[0] && rt.types_by_index[0].instances.length
+    ? rt.types_by_index[0].instances[0] : null;
+  const foe0 = rt.types_by_index[9] && rt.types_by_index[9].instances.length
+    ? rt.types_by_index[9].instances[0] : null;
+  const t = rt.kahanTime ? rt.kahanTime.sum : 0;
+  if (!me0) { console.log('DIAG t=' + t.toFixed(2) + ' noMe'); return; }
+  const car = me0.behavior_insts.find(b => b.steerSpeed !== undefined);
+  let solid = null;
+  try { solid = rt.testOverlapSolid(me0); } catch (e) {}
+  const c = car ? ('en=' + car.enabled + ' ig=' + car.ignoreInput + ' s=' + car.s.toFixed(2) +
+    ' a=' + car.a.toFixed(3) + ' m=' + car.m.toFixed(3)) : 'noCar';
+  const sname = solid ? (solid.type && solid.type.name) + '#' + solid.uid : 'none';
+  let km = '?';
+  try {
+    const crols = vm.runInContext('cr', ctx);
+    for (let ti = 0; ti < rt.types_by_index.length; ti++) {
+      const ty = rt.types_by_index[ti];
+      if (ty && ty.plugin === crols.plugins_.Keyboard && ty.instances.length) {
+        const m = ty.instances[0].keyMap;
+        km = '';
+        for (let kc = 37; kc <= 40; kc++) km += (m[kc] ? '1' : '0');
+        km += '|sp=' + (m[32] ? '1' : '0');
+        break;
+      }
+    }
+  } catch (e) { km = 'err:' + e.message; }
+  console.log('DIAG t=' + t.toFixed(2) + ' lay=' + rt.running_layout.name +
+    ' me=(' + me0.x.toFixed(1) + ',' + me0.y.toFixed(1) + ')' +
+    ' ang=' + me0.angle.toFixed(3) + ' [' + c + '] solid=' + sname + ' km=' + km +
+    ' foe=(' + (foe0 ? foe0.x.toFixed(1) + ',' + foe0.y.toFixed(1) : '?') + ')');
 }
 
 (async () => {
   console.log('=== 无头跑一局（记录数据）===');
   console.log('记录器端口:', REC_PORT, '| 兜底上限:', DURATION + 's（正常由"只剩一辆坦克"结束）');
-  const { rt } = bootGame();
+  const { rt, ctx } = bootGame();
+  if (DIAG) setInterval(() => { try { diagLog(rt, ctx); } catch (e) { console.log('DIAG err:', e.message); } }, 600);
   await new Promise(r => setTimeout(r, 2500));
   try {
     rt.groups_by_name['gamep1'].setGroupActive(true);
@@ -119,12 +157,12 @@ function bootGame() {
   if (!seenBoth) console.log('警告: 30s 内未等到双方坦克，继续运行');
 
   const start = rt.kahanTime.sum;
-  const SAFETY_CEIL = Math.max(DURATION, 240);   // 兜底上限（游戏秒），正常由坦克数决定结束
+  const SAFETY_CEIL = DURATION;   // 兜底上限 = 标准局时长（无头下游戏 60s 计时不触发）
   let lastT = start;
+  let roundStart = null;          // 本局开始（我方坦克出现）时刻，兜底从此刻起算
   let reason = '';
-  // 双方静止检测（与记录器呼应）：双方位置连续 STILL_SEC 游戏秒不变即结束
-  const STILL_SEC = 8.0;
-  let lastMeInst = null, lastFoeInst = null, stillSince = null;
+  let diagLast = 0;
+  let lastMePos = null;
   function meFoe() {
     const me0 = rt.types_by_index[0] && rt.types_by_index[0].instances[0];
     const foe0 = rt.types_by_index[9] && rt.types_by_index[9].instances[0];
@@ -141,21 +179,27 @@ function bootGame() {
     // 对局结束判定：双方都出现过之后，场上只剩一辆坦克 = 一方被击杀
     const c = tankCounts();
     if (seenBoth && c.total < 2) { reason = '一方被击杀，场上仅剩 ' + c.total + ' 辆坦克'; break; }
+    // 我方坦克消失/重生（被击杀即场终）：一次测试 = 一局比赛，
+    // 不在同一场内滚动多局（否则一场出现多份 maze/track，评测口径混乱）。
+    // meN 在死亡瞬间可能被立即 respawn 掩盖，用多重信号：
+    const { me0, foe0 } = meFoe();
+    const meAnim = me0 && me0.cur_animation ? me0.cur_animation.name : '';
+    const ME_DEAD_RE = /(death$|explo|boom|blast|destroy|^dead)/i;
+    if (seenBoth && !me0) { reason = '我方坦克消失（被击杀）'; break; }
+    if (seenBoth && me0 && ME_DEAD_RE.test(meAnim)) { reason = '我方坦克死亡动画(' + meAnim + ')'; break; }
+    if (seenBoth && me0) {
+      if (lastMePos) {
+        const dj = Math.hypot(me0.x - lastMePos.x, me0.y - lastMePos.y);
+        if (dj > 250) { reason = '我方坦克重生跳变 ' + dj.toFixed(0) + 'px'; break; }
+      }
+      lastMePos = { x: me0.x, y: me0.y };
+    } else if (me0) lastMePos = { x: me0.x, y: me0.y };
     // 回到菜单/切布局
     if (rt.running_layout.name !== '1 Player') { reason = '离开对局布局'; break; }
-    // 双方静止检测：位置都不变持续 STILL_SEC 游戏秒 → 对局已结束/僵局
-    const { me0, foe0 } = meFoe();
-    if (me0 && foe0) {
-      const mePos = me0.x.toFixed(1) + ',' + me0.y.toFixed(1);
-      const foePos = foe0.x.toFixed(1) + ',' + foe0.y.toFixed(1);
-      if (mePos === lastMeInst && foePos === lastFoeInst) {
-        if (stillSince === null) stillSince = t;
-        else if (t - stillSince >= STILL_SEC) { reason = '双方静止 ' + STILL_SEC + 's（对局已结束）'; break; }
-      } else stillSince = null;
-      lastMeInst = mePos; lastFoeInst = foePos;
-    }
-    // 兜底：超时上限（正常情况下不会触发）
-    if (t - start > SAFETY_CEIL) { reason = '超时兜底 (' + SAFETY_CEIL + 's)'; break; }
+    // 兜底：超时上限从本局开始（我方坦克出现）起算 —— 严格对齐标准局时长
+    const { me0: meNow } = meFoe();
+    if (!roundStart && meNow) roundStart = t;
+    if (roundStart && t - roundStart > SAFETY_CEIL) { reason = '超时兜底 (' + SAFETY_CEIL + 's)'; break; }
   }
   console.log('对局结束（%s），实际游戏时长: ' + (rt.kahanTime.sum - start).toFixed(1) + 's', reason);
   console.log('数据已由记录器写入 CSV，等待 1s 落盘…');

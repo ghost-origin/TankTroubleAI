@@ -1,6 +1,8 @@
 @echo off
 setlocal
 cd /d "%~dp0"
+set "PY=python"
+if exist "%USERPROFILE%\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe" set "PY=%USERPROFILE%\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe"
 
 echo ========================================
 echo TankTrouble Navigation Benchmark
@@ -13,15 +15,15 @@ if not exist "%JSDOM_PATH%\node_modules\jsdom" (
   npm install jsdom --prefix "%JSDOM_PATH%" || goto :chromium
 )
 
-python run_navigation_headless.py --repo . --matches 10 --out nav_headless_results --engine jsdom --navigation-only
+"%PY%" run_navigation_headless.py --repo . --matches 10 --out nav_headless_results --engine jsdom --navigation-only
 goto :end
 
 :chromium
 echo.
 echo jsdom install failed. Trying Chromium/Playwright fallback...
-python -c "import playwright" >nul 2>nul || pip install playwright
-python -m playwright install chromium
-python run_navigation_headless.py --repo . --matches 10 --duration 12 --game-speed 2 --out nav_headless_results --engine chromium --navigation-only
+"%PY%" -c "import playwright" >nul 2>nul || "%PY%" -m pip install playwright
+"%PY%" -m playwright install chromium
+"%PY%" run_navigation_headless.py --repo . --matches 10 --duration 12 --game-speed 2 --out nav_headless_results --engine chromium --navigation-only
 
 :end
 echo.

@@ -14,6 +14,7 @@ import socket
 import socketserver
 import subprocess
 import sys
+import threading
 import time
 import webbrowser
 
@@ -29,21 +30,32 @@ NAV_SERVER = os.path.join("python", "navigation_bot.py")     # 最新导航 AI W
 def find_numpy_python():
     """找一个能 import numpy 的 Python 解释器（导航 bot 依赖 numpy）。
 
-    顺序：当前解释器 -> python -> python3 -> py launcher -> 常见 conda 路径
-    （用户目录 anaconda3/miniconda3 + 各盘符根 anaconda/miniconda）。
+    顺序：当前解释器 -> 已存在的 conda 路径 -> python/python3/py。
     为避免导航 bot 因缺 numpy 启动崩溃（网页桥连不上 AI 的根因），
     导航模式优先用它；找不到时回退 sys.executable（bot 会报错，游戏仍可玩）。
+
+    性能：探测超时 15s→4s、候选按"存在性"优先、逐个试到第一个成功为止
+    ——旧实现 20+ 候选 × 15s 超时，机器一忙启动要卡几分钟（看起来像死机）。
     """
     import shutil
 
+    def probe(p):
+        try:
+            r = subprocess.run([p, "-c", "import numpy"],
+                               capture_output=True, timeout=4)
+            return r.returncode == 0
+        except Exception:
+            return False
+
+    # 当前解释器先用进程内检查（零开销快路径）
+    try:
+        import numpy  # noqa: F401
+        return sys.executable
+    except Exception:
+        pass
+
     candidates = []
-    # 当前解释器先试（最可能匹配环境）
-    candidates.append(sys.executable)
-    for name in ("python", "python3", "py"):
-        p = shutil.which(name)
-        if p and p not in candidates:
-            candidates.append(p)
-    # 常见 conda 安装路径：用户目录 + 各盘符根
+    # 先排"确定存在"的 conda 路径（比 PATH 上的 python/py 更可靠）
     conda_roots = []
     for base in (os.path.expanduser("~/anaconda3"), os.path.expanduser("~/miniconda3"),
                  os.path.expanduser("~/Anaconda3"), os.path.expanduser("~/Miniconda3")):
@@ -58,20 +70,21 @@ def find_numpy_python():
             p = os.path.join(base, sub)
             if os.path.exists(p):
                 candidates.append(p)
-    # 去重（大小写不敏感）后逐个试探
+    for name in ("python", "python3", "py"):
+        p = shutil.which(name)
+        if p and p not in candidates:
+            candidates.append(p)
+    # 去重（大小写不敏感）后逐个试探，第一个成功即返回
     seen = set()
     for p in candidates:
         key = os.path.normcase(os.path.abspath(p))
         if key in seen:
             continue
         seen.add(key)
-        try:
-            r = subprocess.run([p, "-c", "import numpy"],
-                               capture_output=True, timeout=15)
-            if r.returncode == 0:
-                return p
-        except Exception:
-            continue
+        if probe(p):
+            return p
+    print("  警告: 未找到带 numpy 的 Python 解释器，导航 bot 将无法启动。"
+          "请安装 numpy（如 conda install numpy）后重试。", flush=True)
     return sys.executable   # 兜底：找不到也启动，靠报错提示
 
 DEFAULT_CONFIG = {
@@ -299,6 +312,28 @@ def get_patched_data():
 
 # ---- HTTP 服务 ----
 _AI_PORT = None  # 由 main() 设置，供 /ai-port 接口返回
+_ROUND_RESET_FILE = None  # 由 main() 设置：navigation 模式的 round_reset.csv 绝对路径
+_ROUND_RESET_LOCK = threading.Lock()  # 多个桥事件并发覆盖写时互斥
+
+
+def write_round_reset(seq):
+    """覆盖写"新局信号"文件：最新内容覆盖旧的 = 新一轮开始。
+
+    桥检测到新局事件（me_respawn/瞬移/布局切换/死亡动画）后 GET /round-reset?seq=N，
+    这里把 seq+时间戳覆盖写进 nav_log_dir/round_reset.csv。bot 每帧读该文件，
+    发现内容变化即清理旧数据开始新轮（进程不重启）。
+    """
+    if not _ROUND_RESET_FILE:
+        return False
+    with _ROUND_RESET_LOCK:
+        try:
+            with open(_ROUND_RESET_FILE, "w", encoding="utf-8") as f:
+                f.write("%s,%.3f\n" % (seq, time.time()))
+            return True
+        except Exception as e:
+            print("  round-reset 写入失败: %s" % e, flush=True)
+            return False
+
 
 class GameHandler(http.server.SimpleHTTPRequestHandler):
     def log_message(self, format, *args):
@@ -307,6 +342,23 @@ class GameHandler(http.server.SimpleHTTPRequestHandler):
 
     def do_GET(self):
         path = self.path.split("?")[0]
+        if path == "/round-reset":
+            # 新局信号（浏览器桥 fire-and-forget 调用，可用 F12 手动触发调试）
+            seq = "0"
+            if "?" in self.path:
+                for part in self.path.split("?", 1)[1].split("&"):
+                    if part.startswith("seq="):
+                        seq = part[4:]
+            write_round_reset(seq)
+            blob = b'{"ok":true}'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(blob)))
+            self.end_headers()
+            self.wfile.write(blob)
+            print("  [round-reset] seq=%s -> %s" % (seq, _ROUND_RESET_FILE or "(none)"), flush=True)
+            return
         if path in ("/", ""):
             # 根路径 -> 游戏入口
             self.send_response(302)
@@ -364,6 +416,8 @@ def main():
             if args.ai_mode == "navigation":
                 nav_log_dir = os.path.abspath(args.nav_log_dir)
                 os.makedirs(nav_log_dir, exist_ok=True)
+                # 先给反馈再探测解释器（探测可能花几秒，避免看起来像死机）
+                print("  正在启动导航 AI（探测 numpy 解释器）…", flush=True)
                 # 导航 bot 依赖 numpy：用能找到 numpy 的解释器启动，
                 # 否则 bot 启动即崩、网页桥连不上（红色"AI未连接"预警的根因）。
                 bot_py = find_numpy_python()
@@ -374,9 +428,14 @@ def main():
                     "--port", str(_AI_PORT),
                     "--out-dir", nav_log_dir,
                     "--repo", repo_root,
+                    "--tactical-mode", "chase",
+                    "--visualize",
                 ]
                 label = "导航 AI"
                 where = nav_log_dir
+                # 桥的事件信号落盘位置：bot 与 launcher 共用 out_dir
+                global _ROUND_RESET_FILE
+                _ROUND_RESET_FILE = os.path.join(nav_log_dir, "round_reset.csv")
             else:
                 record_dir = os.path.abspath("data log")
                 cmd = [sys.executable, RECORD_SERVER, str(_AI_PORT), record_dir]
@@ -386,7 +445,69 @@ def main():
             ai_proc = subprocess.Popen(
                 cmd,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             )
+            if args.ai_mode == "navigation":
+                # bot reboot：bot 异常退出时自动重启（状态全清）。
+                # 泵线程必须跟随 state['proc'] 动态切换且**永不退出**——旧实现
+                # 读到 EOF 就 break，重启后的新 bot stdout 无人读 → PIPE 缓冲满
+                # → bot print 阻塞卡死（重启后 bot "哑火/不及时"的根因之一）。
+                import threading
+                state = {'proc': ai_proc, 'started_at': time.time()}
+
+                def _spawn():
+                    state['proc'] = subprocess.Popen(
+                        cmd,
+                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    )
+                    state['started_at'] = time.time()
+
+                def _pump_output():
+                    while True:
+                        p = state['proc']
+                        line = p.stdout.readline()
+                        if line:
+                            sys.stdout.write(line.decode("utf-8", "replace"))
+                            sys.stdout.flush()
+                            continue
+                        # EOF：旧进程已退出。等 watcher 换成新进程后继续泵。
+                        # 泵线程绝不 break（否则新 bot stdout 无人读 → 卡死）。
+                        while state['proc'] is p:
+                            time.sleep(0.05)
+
+                def _watch_and_reboot():
+                    fail_count = 0
+                    last_exit_t = 0.0
+                    while True:
+                        p = state['proc']
+                        if p.poll() is not None:
+                            now = time.time()
+                            uptime = now - state['started_at']
+                            if last_exit_t and now - last_exit_t < 10.0:
+                                fail_count += 1
+                            else:
+                                fail_count = 1
+                            last_exit_t = now
+                            # 连续快速失败 ≥8 次（≈累计 1 分钟）：环境性故障
+                            # （如找不到 numpy），无限重启只会拖死机器 —— 放弃。
+                            if fail_count >= 8:
+                                print("  [reboot] bot 连续快速失败 %d 次，停止重启。"
+                                      "请检查 Python/numpy 环境后重启启动器。" % fail_count, flush=True)
+                                break
+                            # 首次失败 0.2s 快速重启；连续快速失败指数退避，
+                            # 防止启动即崩的 bot 造成无限重启风暴。
+                            delay = 0.2 if fail_count <= 1 else min(30.0, 2.0 ** min(fail_count - 1, 6))
+                            print("  [reboot] bot 已退出（rc=%s, 存活 %.1fs）%.1fs 后重启%s"
+                                  % (p.poll(), uptime, delay,
+                                     '（连续快速失败 x%d，指数退避）' % fail_count if fail_count > 1 else ''),
+                                  flush=True)
+                            time.sleep(delay)
+                            _spawn()
+                        time.sleep(0.05)
+
+                threading.Thread(target=_pump_output, daemon=True).start()
+                threading.Thread(target=_watch_and_reboot, daemon=True).start()
             print("  %s服务已启动: ws://127.0.0.1:%d/ai" % (label, _AI_PORT))
             print("  日志目录: %s" % where)
         except Exception as e:
@@ -420,6 +541,14 @@ def main():
         pass
     finally:
         httpd.server_close()
+        # 关闭时终止"当前"bot（含重启后的新进程）——旧实现只杀首个 ai_proc，
+        # 重启后的 bot 会变孤儿：旧页面仍连着旧代码 bot（"改了代码没生效"根因）。
+        try:
+            st = state if 'state' in locals() else None
+            if st and st.get('proc') and st['proc'].poll() is None:
+                st['proc'].terminate()
+        except Exception:
+            pass
         if ai_proc:
             try:
                 ai_proc.terminate()
