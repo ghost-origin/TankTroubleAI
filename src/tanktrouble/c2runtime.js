@@ -4229,7 +4229,7 @@ quat4.str=function(a){return"["+a[0]+", "+a[1]+", "+a[2]+", "+a[3]+"]"};
 		{
 			var loaderImage = new Image();
 			loaderImage.crossOrigin = "anonymous";
-			this.setImageSrc(loaderImage, "../assets/loading-logo.png");
+			this.setImageSrc(loaderImage, "../../assets/loading-logo.png");
 			this.loaderlogos = {
 				logo: loaderImage
 			};

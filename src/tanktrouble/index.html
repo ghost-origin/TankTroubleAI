@@ -83,10 +83,13 @@
     <script src="c2runtime.js"></script>
 
     <script>
-        // 启动游戏（原网页由官方加载器 playgame.js 调用，这里显式补上）
+        // 启动游戏（原网页由官方加载器 playgame.js 调用，这里显式补上），
+        // 并把运行时对象挂到 window.__rt 供 AI 桥接脚本读取
         jQuery(document).ready(function () {
-            cr_createRuntime("c2canvas");
+            window.__rt = cr_createRuntime("c2canvas");
         });
     </script>
+
+    <script src="../ai/ai-bridge.js"></script>
 </body>
 </html>

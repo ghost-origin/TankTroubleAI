@@ -8,7 +8,7 @@ const fs = require('fs');
 const path = require('path');
 const vm = require('vm');
 const { JSDOM, VirtualConsole } = require(process.env.JSDOM_PATH + '/node_modules/jsdom');
-const dir = path.join(process.cwd(), 'src');   // 游戏运行文件在 src/ 下
+const dir = path.join(process.cwd(), 'src', 'tanktrouble');   // 游戏运行文件在 src/ 下
 
 const vc = new VirtualConsole();
 const msgs = [];

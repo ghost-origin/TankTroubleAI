@@ -4,7 +4,7 @@
 // 输出各武器的 冲量(速度)/导弹速度/寿命阈值/道具刷新参数，人工核对即可。
 const base = process.argv[2] || 'http://127.0.0.1:8000';
 (async () => {
-  const r = await fetch(base + '/src/data.js');
+  const r = await fetch(base + '/src/tanktrouble/data.js');
   const text = await r.text();
   console.log('status', r.status, 'cache-control:', r.headers.get('cache-control'), 'size:', text.length);
   const data = JSON.parse(text.replace(/^\uFEFF/, ''));
