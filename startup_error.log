@@ -1,0 +1,8 @@
+TankTrouble Autonomous AI startup
+Python: 3.13.15 (tags/v3.13.15:4061bc4, Aug  5 2026, 13:05:39) [MSC v.1944 64 bit (AMD64)]
+Project: C:\Users\jasongeorge\deepseek harness workspace\TankTroubleAI_Autonomous_Combat_v3
+Project files: OK
+Runtime dependencies: OK
+Starting game + autonomous combat AI (auto-aim, no pathfinding)...
+A browser window should open automatically.
+RUN: C:\Users\jasongeorge\AppData\Local\Programs\Python\Python313\python.exe C:\Users\jasongeorge\deepseek harness workspace\TankTroubleAI_Autonomous_Combat_v3\launcher_autonomous.py
