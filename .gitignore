@@ -4,3 +4,4 @@ __pycache__/
 *.pyc
 *.csv
 .npm-cache/
+归档/
