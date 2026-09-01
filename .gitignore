@@ -5,3 +5,9 @@ __pycache__/
 *.csv
 .npm-cache/
 褰掓。/
+*.png
+# 测试/运行产物（今晚迁移时追加）
+test/results/
+nav_headless_results/
+web_nav_logs/
+turn_benchmark_results/
