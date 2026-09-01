@@ -158,7 +158,8 @@ def patch_data(data, cfg):
     return data
 
 def rewrite_media_paths(obj):
-    """把 data.js 里的资源文件名统一加上 assets/ 前缀（贴图/音效/迷宫数据已移到 assets 目录）"""
+    """把 data.js 里的资源文件名统一加上 assets/ 前缀（贴图/迷宫数据已移到 assets 目录）。
+    音频元数据（project[7]）不在这里加前缀——音频播放/预载路径由 files_subfolder（project[8]）统一处理。"""
     MEDIA_EXTS = ('.png', '.jpg', '.jpeg', '.gif', '.webp', '.m4a', '.ogg', '.mp3',
                   '.wav', '.ttf', '.woff', '.woff2', '.json')
 
@@ -177,7 +178,14 @@ def rewrite_media_paths(obj):
                 v[k] = walk(v[k])
         return v
 
-    walk(obj)
+    project = obj.get("project")
+    if isinstance(project, list):
+        for idx, section in enumerate(project):
+            if idx == 7:      # 音频元数据表：交给 files_subfolder，避免双重前缀
+                continue
+            walk(section)
+    else:
+        walk(obj)
 
 def build_data(cfg):
     with open(BASE_FILE, "r", encoding="utf-8-sig") as f:
@@ -185,6 +193,12 @@ def build_data(cfg):
     bom = "\ufeff" if text.startswith("\ufeff") else ""
     data = json.loads(text.lstrip("\ufeff"))
     data = patch_data(data, cfg)
+    # files_subfolder：引擎播放/预载音频时拼路径用（file 基名 + ".ogg"/".m4a"），
+    # 原版为空字符串（媒体在页面根目录）；重组后音频在 assets/，这里指向它
+    try:
+        data["project"][8] = "../assets/"
+    except Exception:
+        pass
     rewrite_media_paths(data)
     out = bom + json.dumps(data, ensure_ascii=False, separators=(",", ":"))
     return out.encode("utf-8")
