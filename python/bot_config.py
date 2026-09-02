@@ -15,8 +15,9 @@ WP_SPACING_PX = 40.0                    # 路点间距（用户指定）
 MIN_ACCEPT_PATH_PX = 100.0              # 只接受 ≥100px 的规划路径（短窗口导致频繁目标切换/抖动）
 
 # ---------------- OODA / 规划节奏 ----------------
-OODA_PERIOD_S = 0.75                     # 规划频率 1Hz（用户指定）
-LOCAL_WINDOW_RETRY_S = 0.2              # 局部窗口内未达目标时的重规划间隔
+OODA_PERIOD_S = 0.50                    # 常规重规划 2Hz，减少高速时目标滞后
+LOCAL_WINDOW_RETRY_S = 0.05             # 进入窗口尾段后 20Hz 快速续接
+WINDOW_REPLAN_FRACTION = 0.65           # 剩余 65% 窗口时开始预取下一段路径
 DEFAULT_PREDICTION_HORIZON_S = 0.0      # 敌方卡尔曼预测时域（0=关）
 
 # ---------------- 转向控制（Stanley 横向控制器，借鉴斯坦福 DARPA 挑战赛） ----------------
@@ -44,14 +45,17 @@ CROSS_GAIN = 0.02                       # cross-track 纠偏增益（rad/px，�
 CROSS_CORR_MAX = 0.6                    # 纠偏上限（rad，备用）
 
 # ---------------- 速度控制 ----------------
-CRUISE_SPEED_HIGH = 70.0                # 巡航上限：超过则松油（R≈18.4px，实际稳态≈65px/s）
-CRUISE_SPEED_LOW = 65.0                 # 巡航下限：低于则加油
+# 玩家坦克与敌方坦克使用相同的游戏物理上限。只要存在已验证路径，控制器持续按住
+# 前进键，由游戏自身的 maxspeed=125px/s 限速，不再进行直线/弯道 PWM 降速。
+GAME_MAX_SPEED_PX_S = 125.0
+CRUISE_SPEED_HIGH = GAME_MAX_SPEED_PX_S # 兼容测试/旧工具；线上控制器不再以它松油
+CRUISE_SPEED_LOW = GAME_MAX_SPEED_PX_S
 PID_KP_V = 0.1                          # 速度 P（观测器外备用增益）
 SPEED_HYST_PX_S = 3.0                   # 油门滞回死区：±3px/s 内不翻油门（防喘动）
 SPEED_MODEL_ACCEL = 200.0               # 运动模型加速度（与游戏 Car accel/decel 一致）
 SPEED_MEAS_CORR = 0.15                  # 测量慢修正系数：模型为主、差分速度为辅
-CORNER_SPEED = 60.0                     # 过弯速度上限（R=60/3.8≈15.8px）
-CORNER_MIN_SPEED = 12.0                 # 过弯速度下限
+CORNER_SPEED = GAME_MAX_SPEED_PX_S      # 兼容旧工具：弯道不再主动限速
+CORNER_MIN_SPEED = GAME_MAX_SPEED_PX_S
 CORNER_LOOKAHEAD_PX = 60.0              # 曲率前瞻窗口
 STEER_SPEED_PX_S = 3.8                  # 游戏转向速率（rad/s，实测值）
 

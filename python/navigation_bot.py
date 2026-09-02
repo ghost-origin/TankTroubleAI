@@ -621,7 +621,9 @@ class Bot:
         return max(-STEER_SPEED_PX_S, min(STEER_SPEED_PX_S, w_des))
 
     def _corner_target_speed(self):
-        """曲率前瞻：沿密集路径（4px 采样，self.dense_path）在 60px 窗口内取
+        """旧版曲率限速计算（保留给离线诊断，满速线上控制器不再调用）。
+
+        沿密集路径（4px 采样，self.dense_path）在 60px 窗口内取
         min 曲率半径（8px 采样间隔降噪）→ 目标速度 v = min_r * STEER_SPEED
         （clamp 12..CORNER_SPEED）。直路返回 None。行驶转弯半径
         R=speed/STEER_SPEED，速度高于目标会外切。
@@ -835,7 +837,7 @@ class Bot:
                 self.current_window_goal_reached = pr.window_goal_reached
                 self.current_window_replan_remaining = min(
                     WINDOW_REPLAN_REMAINING_PX,
-                    max(12.0, pr.window_target_length * 0.35),
+                    max(20.0, pr.window_target_length * WINDOW_REPLAN_FRACTION),
                 )
                 self.last_path_switch_t = t
         else:
@@ -956,7 +958,7 @@ class Bot:
             desired = math.atan2(ty - me['y'], tx - me['x'])
             w_des = PID_KP_TH * wrap(desired - me['angle'])
         duty = min(1.0, abs(w_des) / STEER_SPEED_PX_S)
-        self._steer_accum += duty
+        self._steer_accum = getattr(self, '_steer_accum', 0.0) + duty
         steer_on = False
         if self._steer_accum >= 1.0:
             self._steer_accum -= 1.0
@@ -969,26 +971,19 @@ class Bot:
         # 记录本帧实际施加的转向角速度（供 D 项参考微分用，无测量噪声）
         self._omega_applied = (STEER_SPEED_PX_S if steer_on else 0.0) * (1 if w_des > 0 else -1)
 
-        # x 通道（纵向）：运动模型观测器 + 滞回开关油门。
-        # 桥端速度 = 位置差分（量化噪声 ~6px/s），直接控会反复翻油门。
-        # 模型按油门状态积分游戏加速度（无噪声、无滞后），测量只做慢速
-        # 修正 —— 速度环无低频喘动（旧 P-PWM ~1Hz ±15px/s 卡顿感主因）。
+        # x 通道（纵向）：与敌方使用相同的游戏物理最高速度。
+        # 有已验证路径时持续按住前进键，取消直路 65px/s 与弯道 12~60px/s
+        # 的主动限速；实际速度由游戏 Car.maxspeed（约 125px/s）统一封顶。
+        # 速度测量仍做平滑，仅供 Stanley 曲率前馈使用，不参与油门开关。
         speed_now = math.hypot(me.get('vx', 0.0), me.get('vy', 0.0))
-        if self._v_smooth is None:
+        if getattr(self, '_v_smooth', None) is None:
             self._v_smooth = speed_now
         else:
-            a_model = SPEED_MODEL_ACCEL if self._throttle_on else -SPEED_MODEL_ACCEL
-            self._v_smooth += a_model * self._frame_dt
             self._v_smooth += SPEED_MEAS_CORR * (speed_now - self._v_smooth)
-        v_target = self._corner_target_speed() or CRUISE_SPEED_LOW
-        if self._v_smooth < v_target - SPEED_HYST_PX_S:
-            self._throttle_on = True
-        elif self._v_smooth > v_target + SPEED_HYST_PX_S:
-            self._throttle_on = False
-        if self._throttle_on:
-            k['up'] = 1
+        self._throttle_on = True
+        k['up'] = 1
 
-        self.controller_mode = 'PID'
+        self.controller_mode = 'FULL_SPEED_PATH'
         return {'keys':k, 'fire':0}
 
     def on_message(self, c, text):
