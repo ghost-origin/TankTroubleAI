@@ -23,6 +23,9 @@ LOCAL_WINDOW_RETRY_S = 0.05             # 进入窗口尾段后 20Hz 快速续�
 # v2=车中心−A；cos(v1,v2) ≤ 0 ⟺ 车已越过 A 点 → 进入后段 → 快速续接。
 WINDOW_REPLAN_FRACTION = 0.70           # 弧长标记点分数（越过此点进入窗口后段）
 WINDOW_REPLAN_REF_BACK = 0.03           # 标记点后向参考弧长（v1 方向近似轨迹切线）
+WINDOW_REPLAN_TAIL_FRACTION = 0.95      # 兜底标记点分数：车偏离轨迹导致 0.7 判据
+                                        # 失效时，越过 0.95（距终点 5%）必然几何触发
+WINDOW_REPLAN_TAIL_REF_BACK = 0.02      # 兜底标记点后向参考弧长（0.95 → 0.93）
 WINDOW_REPLAN_TAIL_REMAINING_PX = 45.0  # 兜底判据：剩余路径 ≤45px 也视为尾段
                                         # （车被弹开/偏离轨迹时弧长判据不可靠）
 DEFAULT_PREDICTION_HORIZON_S = 0.0      # 敌方卡尔曼预测时域（0=关）
@@ -69,6 +72,9 @@ TURN_BRAKE_RAD = 2.5                    # 急弯降速转向阈值（rad/s）：
                                         # 时打舵帧松开油门，让游戏速度 s 衰减，触发物理
                                         # "低速转向保底" → 转弯半径从 33px 缩到 ~20px 级；
                                         # 0 = 关闭（始终全速转向，R 恒 33px）
+TURN_BRAKE_MIN_SPEED_PX_S = 40.0        # 起步保护：车速低于此值不压油门。
+                                        # 否则"车头与路径差角大"（困角落的常态）时
+                                        # |w_des| 恒超阈值 → 油门被压死 → v=0 原地转圈死锁
 
 # ---------------- 原地旋转（无路线时） ----------------
 SPIN_SIDE_SIN_THRESHOLD = 0.15          # 选向阈值：|sinθ|>0.15（≈8.6°）时朝敌所在侧转

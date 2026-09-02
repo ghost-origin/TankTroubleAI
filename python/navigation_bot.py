@@ -90,6 +90,7 @@ class Bot:
         self.blocked = None
         self.blocked_turn = None
         self.free_dist = None
+        self.dir_ok = None
         self.maze_signature = None
         self.maze_written = False
         self.exit_on_round_end = False
@@ -368,6 +369,7 @@ class Bot:
         self.blocked = None
         self.blocked_turn = None
         self.free_dist = None
+        self.dir_ok = None
         self.maze_written = False
         self.path = []
         self.dense_path = []
@@ -747,14 +749,29 @@ class Bot:
             acc += seg
         return dense[-1]
 
+    def _past_marker_at(self, dense, total, frac, ref_back, me):
+        """单标记点判据：车是否已越过轨迹 frac 弧长标记点。
+
+        标记点 A = 轨迹 frac 弧长处；参考点 B = A 之前 ref_back 弧长处；
+        v1 = B−A（指向轨迹后方，近似 A 点反向切线）；v2 = 车中心 − A。
+        cos(v1, v2) ≤ 0 ⟺ 夹角 ≥90° ⟺ 车在 A 点之后。退化时保守返回 True。
+        """
+        ax, ay = self._point_at_arc(dense, total * frac)
+        bx, by = self._point_at_arc(dense, max(0.0, total * (frac - ref_back)))
+        v1x, v1y = bx - ax, by - ay
+        v2x, v2y = me['x'] - ax, me['y'] - ay
+        denom = math.hypot(v1x, v1y) * math.hypot(v2x, v2y)
+        if denom < 1e-9:
+            return True
+        return (v1x * v2x + v1y * v2y) / denom <= 0.0
+
     def past_window_marker(self, me):
         """弧长标记点判据（用户方法）：车是否已越过执行窗口轨迹的
         WINDOW_REPLAN_FRACTION（0.70）弧长标记点。
 
-        标记点 A = 轨迹 70% 弧长处；参考点 B = A 之前 REF_BACK（3%）弧长处；
-        v1 = B−A（指向轨迹后方，近似 A 点反向切线）；
-        v2 = 车中心 − A。
-        cos(v1, v2) ≤ 0 ⟺ 夹角 ≥90° ⟺ 车在 A 点之后 → 进入窗口后段。
+        主判据 70% 标记点；若车偏离轨迹导致主判据失效（横向误差大时
+        夹角判据失真），用 0.95 标记点兜底 —— 车越过 0.95 弧长点（距
+        终点只剩 5%）时几何上必然触发，确保窗口末端必然进入快速续接。
         路径过短/标记点退化时保守返回 True（尽早进入快速续接）。
         """
         dense = self.dense_path
@@ -764,15 +781,11 @@ class Bot:
                     for a, b in zip(dense, dense[1:]))
         if total <= 0.0:
             return True
-        frac = WINDOW_REPLAN_FRACTION
-        ax, ay = self._point_at_arc(dense, total * frac)
-        bx, by = self._point_at_arc(dense, max(0.0, total * (frac - WINDOW_REPLAN_REF_BACK)))
-        v1x, v1y = bx - ax, by - ay
-        v2x, v2y = me['x'] - ax, me['y'] - ay
-        denom = math.hypot(v1x, v1y) * math.hypot(v2x, v2y)
-        if denom < 1e-9:
+        if self._past_marker_at(dense, total,
+                                WINDOW_REPLAN_FRACTION, WINDOW_REPLAN_REF_BACK, me):
             return True
-        return (v1x * v2x + v1y * v2y) / denom <= 0.0
+        return self._past_marker_at(dense, total,
+                                    WINDOW_REPLAN_TAIL_FRACTION, WINDOW_REPLAN_TAIL_REF_BACK, me)
 
     def replan(self, t, me, foe, local_window_due=False):
         if self.raw_wall is None or self.blocked is None or self.round_ended:
@@ -1039,9 +1052,14 @@ class Bot:
         k['up'] = 1
         # 急弯降速转向：需要大角速度（|w_des| > TURN_BRAKE_RAD）时，打舵帧
         # 松开油门 —— 游戏速度 s 衰减后触发物理"低速转向保底"（|s|/maxspeed
-        # 下限 0.5），转弯半径随速度线性缩小（R=s/1.9，33px → ~20px 级），
-        # 接近停车时近乎原地转。只对急弯生效，直线纠偏/普通弯不受影响。
-        if TURN_BRAKE_RAD > 0 and steer_on and abs(w_des) > TURN_BRAKE_RAD:
+        # 下限 0.5），转弯半径随速度线性缩小（R=s/1.9，33px → ~20px 级）。
+        # 只对急弯生效，直线纠偏/普通弯不受影响。
+        # 起步保护：车速低于 TURN_BRAKE_MIN_SPEED_PX_S 时不压油门 —— 否则
+        # 车头与路径差角大时 |w_des| 恒超阈值 → 油门被压死 → v=0 原地转圈
+        # （三面围城"规划成功但走不出去"的死锁根因，见分析报告缺陷 1）。
+        if (TURN_BRAKE_RAD > 0 and steer_on
+                and abs(w_des) > TURN_BRAKE_RAD
+                and speed_now > TURN_BRAKE_MIN_SPEED_PX_S):
             k['up'] = 0
 
         self.controller_mode = 'FULL_SPEED_PATH'
