@@ -33,6 +33,8 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
+from kalman_path_predictor import ConstantVelocityKalman2D
+
 Point = Tuple[float, float]
 
 # 弹道模拟
@@ -55,7 +57,9 @@ FINE_SPAN_RAD = math.radians(2.5)    # 细调范围（围绕粗扫最优角）
 
 # 瞄准 / 开火
 AIM_DEADBAND_RAD = math.radians(3.0)   # 转向死区（进入后停止转向，防抖动）
-FIRE_ALIGN_RAD = math.radians(8.0)     # 车头对准目标角在此误差内即可开火
+FIRE_ALIGN_RAD = math.radians(5.0)     # 发射条件：车头角与计算角偏差 ≤5° 才开火。
+                                        # （原 8° 时车头偏 5~8° 就开火，反射弹道
+                                        #   对角度极敏感 → 打偏/自伤）
 AIM_SWITCH_RAD = math.radians(45.0)    # 新解与旧目标角差超过此值时不切换（防目标角乱跳）
 U_TURN_LOCK_RAD = math.pi - 0.35       # 接近 180° 掉头时锁定转向方向，防左右抖动
 FIRE_PULSE_S = 0.10                    # 按键脉冲时长
@@ -308,6 +312,11 @@ class CombatController:
         self.last_solve_t = -1e9
         self.turn_dir = 0
         self.last_sol: Optional[ShotSolution] = None  # 最近一次求解的弹道（调试用）
+        # 敌人轨迹恒速卡尔曼：桥上报的 vx/vy 是位置差分、噪声大（偶发几百 px/s），
+        # 直接外推会让预测点乱跳、瞄准点不稳定。用卡尔曼平滑位置/速度，
+        # 再 forecast(lead_t) 预测子弹命中时刻敌人的位置，车头直接瞄准预测点。
+        self.kalman = ConstantVelocityKalman2D()
+        self._kf_ready = False
 
     # ------------------------------------------------------------------
     def attack(self, t: float, me: Dict, foe: Dict, bullets: Sequence[Dict],
@@ -328,17 +337,46 @@ class CombatController:
         me_x, me_y = float(me['x']), float(me['y'])
         self.shell_speed = max(160.0, estimate_shell_speed(bullets))
 
+        # 每帧把敌人观测喂进恒速卡尔曼（位置+差分速度），平滑噪声速度，
+        # 之后用 kalman.forecast(lead_t) 预测子弹命中时刻的敌人位置。
+        self.kalman.update(float(t), float(foe['x']), float(foe['y']),
+                           float(foe.get('vx', 0.0)), float(foe.get('vy', 0.0)))
+        self._kf_ready = True
+
+        def predict_foe(lead_t: float) -> Point:
+            """子弹飞行 lead_t 秒后敌人的预测位置（卡尔曼 forecast）。
+
+            预测点必须在地图内且为自由空间，否则退回：卡尔曼滤波后的当前位置
+            → 敌人原始观测位置。避免瞄准点预测进墙/出界导致弹道模拟穿墙误判。
+            """
+            if self._kf_ready:
+                px, py = self.kalman.forecast(lead_t)
+            else:
+                px, py = float(foe['x']), float(foe['y'])
+            h, w = raw_wall.shape
+            ok = (0 <= int(round(px)) < w and 0 <= int(round(py)) < h
+                  and not raw_wall[int(round(py)), int(round(px))])
+            if not ok and self._kf_ready:
+                s = self.kalman.state
+                px2, py2 = float(s[0]), float(s[1])
+                if (0 <= int(round(px2)) < w and 0 <= int(round(py2)) < h
+                        and not raw_wall[int(round(py2)), int(round(px2))]):
+                    return (px2, py2)
+            if not ok:
+                return (float(foe['x']), float(foe['y']))
+            return (px, py)
+
         # ---- 当前朝向（给定角度）能否命中：实时验证 ----
         def can_hit(angle: float):
             x0 = me_x + math.cos(angle) * MUZZLE_OFFSET_PX
             y0 = me_y + math.sin(angle) * MUZZLE_OFFSET_PX
             d0 = math.hypot(float(foe['x']) - me_x, float(foe['y']) - me_y)
             lead_t = min(MAX_LEAD_S, d0 / self.shell_speed)
-            target = predicted_aim_point(foe, lead_t, raw_wall)
+            target = predict_foe(lead_t)
             sol = simulate_ray(raw_wall, x0, y0, angle, target)
             if sol is not None:
                 lead_t = min(MAX_LEAD_S, sol.path_len / self.shell_speed)
-                target = predicted_aim_point(foe, lead_t, raw_wall)
+                target = predict_foe(lead_t)
                 return simulate_ray(raw_wall, x0, y0, angle, target)
             return None
 
@@ -351,11 +389,11 @@ class CombatController:
             self.last_solve_t = t
             d0 = math.hypot(float(foe['x']) - me_x, float(foe['y']) - me_y)
             lead_t = min(MAX_LEAD_S, d0 / self.shell_speed)
-            target = predicted_aim_point(foe, lead_t, raw_wall)
+            target = predict_foe(lead_t)
             sol = solve_shot(raw_wall, me, target, center_angle=self.aim_angle)
             if sol is not None:
                 lead_t = min(MAX_LEAD_S, sol.path_len / self.shell_speed)
-                target = predicted_aim_point(foe, lead_t, raw_wall)
+                target = predict_foe(lead_t)
                 sol2 = solve_shot(raw_wall, me, target, center_angle=sol.angle)
                 if sol2 is not None:
                     sol = sol2
