@@ -17,7 +17,14 @@ MIN_ACCEPT_PATH_PX = 100.0              # 只接受 ≥100px 的规划路径（�
 # ---------------- OODA / 规划节奏 ----------------
 OODA_PERIOD_S = 0.50                    # 常规重规划 2Hz，减少高速时目标滞后
 LOCAL_WINDOW_RETRY_S = 0.05             # 进入窗口尾段后 20Hz 快速续接
-WINDOW_REPLAN_FRACTION = 0.65           # 剩余 65% 窗口时开始预取下一段路径
+# 窗口尾段判据（弧长标记点法，用户方法）：
+# 在轨迹 WINDOW_REPLAN_FRACTION（默认 0.70 = 已走 70% 弧长）处取标记点 A，
+# 其前 WINDOW_REPLAN_REF_BACK 弧长处取参考点 B；v1=B−A（指向轨迹后方），
+# v2=车中心−A；cos(v1,v2) ≤ 0 ⟺ 车已越过 A 点 → 进入后段 → 快速续接。
+WINDOW_REPLAN_FRACTION = 0.70           # 弧长标记点分数（越过此点进入窗口后段）
+WINDOW_REPLAN_REF_BACK = 0.03           # 标记点后向参考弧长（v1 方向近似轨迹切线）
+WINDOW_REPLAN_TAIL_REMAINING_PX = 45.0  # 兜底判据：剩余路径 ≤45px 也视为尾段
+                                        # （车被弹开/偏离轨迹时弧长判据不可靠）
 DEFAULT_PREDICTION_HORIZON_S = 0.0      # 敌方卡尔曼预测时域（0=关）
 
 # ---------------- 转向控制（Stanley 横向控制器，借鉴斯坦福 DARPA 挑战赛） ----------------

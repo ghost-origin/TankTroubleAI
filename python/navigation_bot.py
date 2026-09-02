@@ -43,6 +43,7 @@ PLANS_COLUMNS = [
     'path_source','path_validated','validation_reason','raw_path_points','executed_path_points',
     'global_path_length_px','window_path_length_px','window_target_length_px',
     'window_lookahead_length_px','window_goal_reached',
+    'local_window_due','replan_period_s',
     'prediction_horizon_s','observed_foe_x','observed_foe_y',
     'predicted_foe_x','predicted_foe_y','predicted_foe_path'
 ]
@@ -103,6 +104,7 @@ class Bot:
         self.current_tactical_target = None
         self.current_window_goal_reached = False
         self.current_window_replan_remaining = WINDOW_REPLAN_REMAINING_PX
+        self._tail_due_last = False          # 尾段上升沿记忆（进入尾段瞬间立即续接）
         self.controller_mode = 'STOP'
         self._init_accel_since = None
         self._last_steer_dir = 0
@@ -734,7 +736,45 @@ class Bot:
         pts = [(me['x'], me['y'])] + list(self.path[self.wp_idx:])
         return sum(math.hypot(b[0]-a[0], b[1]-a[1]) for a,b in zip(pts, pts[1:]))
 
-    def replan(self, t, me, foe):
+    def _point_at_arc(self, dense, target_len):
+        """沿密集路径按弧长取点（线性插值）。"""
+        acc = 0.0
+        for a, b in zip(dense, dense[1:]):
+            seg = math.hypot(b[0] - a[0], b[1] - a[1])
+            if acc + seg >= target_len:
+                t = (target_len - acc) / seg if seg > 0 else 0.0
+                return (a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t)
+            acc += seg
+        return dense[-1]
+
+    def past_window_marker(self, me):
+        """弧长标记点判据（用户方法）：车是否已越过执行窗口轨迹的
+        WINDOW_REPLAN_FRACTION（0.70）弧长标记点。
+
+        标记点 A = 轨迹 70% 弧长处；参考点 B = A 之前 REF_BACK（3%）弧长处；
+        v1 = B−A（指向轨迹后方，近似 A 点反向切线）；
+        v2 = 车中心 − A。
+        cos(v1, v2) ≤ 0 ⟺ 夹角 ≥90° ⟺ 车在 A 点之后 → 进入窗口后段。
+        路径过短/标记点退化时保守返回 True（尽早进入快速续接）。
+        """
+        dense = self.dense_path
+        if not dense or len(dense) < 2:
+            return True
+        total = sum(math.hypot(b[0] - a[0], b[1] - a[1])
+                    for a, b in zip(dense, dense[1:]))
+        if total <= 0.0:
+            return True
+        frac = WINDOW_REPLAN_FRACTION
+        ax, ay = self._point_at_arc(dense, total * frac)
+        bx, by = self._point_at_arc(dense, max(0.0, total * (frac - WINDOW_REPLAN_REF_BACK)))
+        v1x, v1y = bx - ax, by - ay
+        v2x, v2y = me['x'] - ax, me['y'] - ay
+        denom = math.hypot(v1x, v1y) * math.hypot(v2x, v2y)
+        if denom < 1e-9:
+            return True
+        return (v1x * v2x + v1y * v2y) / denom <= 0.0
+
+    def replan(self, t, me, foe, local_window_due=False):
         if self.raw_wall is None or self.blocked is None or self.round_ended:
             return
 
@@ -790,14 +830,23 @@ class Bot:
                     accepted = True
                 elif held >= PATH_HOLD_MAX_S:
                     accepted = True
+                elif local_window_due:
+                    # 窗口尾段续接是保底动作：标记点触发后旧路径只剩 ~30%
+                    # （48px≈0.38s），新窗口（160px）必然比剩余旧路径长，
+                    # 按 ratio 比较永远被拒 → 车直走到窗口终点被迫停车。
+                    # 尾段时接受任何有效新路径（接受后新窗口从车位置开始，
+                    # 判据自然退出尾段，不会每周期换路径）。
+                    accepted = True
 
             if accepted:
                 # 短程方向粘滞：旧路径还有一小段可走时，拒绝与当前行进方向
                 # 差 >90° 的新路径 —— 防路口等长双路 1s 级来回掉头。
-                # 状态升级(staging→attack)与超时(PATH_HOLD_MAX_S)仍放行。
+                # 状态升级(staging→attack)与超时(PATH_HOLD_MAX_S)仍放行；
+                # 窗口尾段续接（local_window_due）同样放行 —— 旧路径即将
+                # 耗尽，掉头去新方向是续接的必然代价。
                 if (active and old_remaining > PATH_SWITCH_MIN_REMAINING_PX
                         and len(pr.path) > 1 and not staging_to_attack
-                        and held < PATH_HOLD_MAX_S):
+                        and held < PATH_HOLD_MAX_S and not local_window_due):
                     cur_pt = self.path[self.wp_idx] if self.wp_idx < len(self.path) else None
                     if cur_pt is not None:
                         cur_dir = math.atan2(cur_pt[1] - me['y'], cur_pt[0] - me['x'])
@@ -835,10 +884,9 @@ class Bot:
                 if pr.target is not None:
                     self.current_tactical_target = pr.target
                 self.current_window_goal_reached = pr.window_goal_reached
-                self.current_window_replan_remaining = min(
-                    WINDOW_REPLAN_REMAINING_PX,
-                    max(20.0, pr.window_target_length * WINDOW_REPLAN_FRACTION),
-                )
+                # 兜底判据阈值：弧长标记点（70%）为主判据，剩余路径长度
+                # 只在车偏离轨迹导致弧长判据不可靠时兜底。
+                self.current_window_replan_remaining = WINDOW_REPLAN_TAIL_REMAINING_PX
                 self.last_path_switch_t = t
         else:
             # Do not throw away a still-useful path just because one 1 Hz OODA
@@ -889,6 +937,8 @@ class Bot:
             'window_target_length_px':round(pr.window_target_length, 3),
             'window_lookahead_length_px':round(pr.window_lookahead_length, 3),
             'window_goal_reached':int(pr.window_goal_reached),
+            'local_window_due':int(local_window_due),
+            'replan_period_s':round(LOCAL_WINDOW_RETRY_S if local_window_due else OODA_PERIOD_S, 3),
             'prediction_horizon_s':round(self.prediction_horizon_s, 3),
             'observed_foe_x':round(foe['x'], 3),
             'observed_foe_y':round(foe['y'], 3),
@@ -933,10 +983,14 @@ class Bot:
         # 局间/无图保持停止；局内无合理路线才原地旋转
         if self.round_ended:
             return {'keys':k, 'fire':0}
-        if not self.path or self.wp_idx >= len(self.path):
+        if not self.path:
             # 无合理路线：原地旋转观察（每个 OODA 周期重规划，路径出现即恢复行驶）。
             self.controller_mode = 'SPIN_NO_PATH'
             return self._spin_action(me)
+        if self.wp_idx >= len(self.path):
+            # 轨迹已执行完毕（到达规划终点）：停车等待续接，不盲目前进。
+            self.controller_mode = 'PATH_DONE_STOP'
+            return self.stop_action()
 
         while self.wp_idx < len(self.path):
             tx, ty = self.path[self.wp_idx]
@@ -945,9 +999,10 @@ class Bot:
             else:
                 break
         if self.wp_idx >= len(self.path):
-            # 窗口走完、新规划未到：同样原地旋转等待
-            self.controller_mode = 'SPIN_NO_PATH'
-            return self._spin_action(me)
+            # 窗口走完、新规划未到：停车等待（尾段判据会以 20Hz 快速续接），
+            # 不盲目前进。replan 失败清空路径后自然转入 SPIN_NO_PATH 观察。
+            self.controller_mode = 'PATH_DONE_STOP'
+            return self.stop_action()
 
         # Stanley 横向控制（曲率前馈 + 航向 PD + 横向误差 atan 项）→ ω_des（rad/s）。
         # 占空比 PWM：duty = |ω_des|/3.8（转向时间占比）；ω>0 = 顺时针 = 右转。
@@ -1125,11 +1180,20 @@ class Bot:
             return
 
         remaining = self.remaining_path_length(me)
+        # 窗口尾段判据：弧长标记点法为主（车越过轨迹 70% 弧长点），
+        # 剩余路径长度兜底（车被弹开/偏离轨迹时弧长判据不可靠）。
+        past_marker = self.past_window_marker(me)
         local_window_due = (not self.current_window_goal_reached and
-                            remaining <= self.current_window_replan_remaining)
+                            (past_marker or remaining <= self.current_window_replan_remaining))
         replan_period = LOCAL_WINDOW_RETRY_S if local_window_due else OODA_PERIOD_S
         if t - self.last_plan_t >= replan_period:
-            self.replan(t, me, foe)
+            self.replan(t, me, foe, local_window_due=local_window_due)
+        elif local_window_due and not self._tail_due_last:
+            # 刚进入尾段（上升沿）：立即续接一次，不等周期 —— 标记点触发时
+            # 剩余窗口只有 (1-0.7)*160≈48px≈0.38s 行程，必须抢占这段缓冲，
+            # 否则车走到终点后新路径还没规划出来（停车等下一周期）。
+            self.replan(t, me, foe, local_window_due=True)
+        self._tail_due_last = bool(local_window_due)
         action = self.action(me)
         if self.visualize:
             action = dict(action)
