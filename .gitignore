@@ -11,3 +11,5 @@ test/results/
 nav_headless_results/
 web_nav_logs/
 turn_benchmark_results/
+*.flag
+*.log
