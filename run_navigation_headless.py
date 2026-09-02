@@ -96,7 +96,7 @@ def main():
         bp=subprocess.Popen([sys.executable,bot,'--port',str(port),'--out-dir',rd,'--repo',repo,
                              '--tactical-mode',a.tactical_mode,
                              '--prediction-horizon-s',str(a.prediction_horizon_s),
-                             '--exit-on-round-end'],
+                             '--exit-on-round-end','--no-combat'],
                             cwd=repo,stdout=bot_log,stderr=subprocess.STDOUT)
         time.sleep(0.6)
         try:

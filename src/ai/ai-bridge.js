@@ -317,6 +317,10 @@
         left: { key: 'ArrowLeft', code: 37 },
         right: { key: 'ArrowRight', code: 39 }
     };
+    // TankTrouble P1 默认开火键是 M（keyCode 77）。鼠标 mousedown/up 事件
+    // 在本导出版本中不能可靠触发 Construct 的 Keyboard 条件（v3 实战验证），
+    // 开火必须走原生键盘绑定。
+    var FIRE_KEY = { key: 'm', domCode: 'KeyM', code: 77 };
     var held = { up: 0, down: 0, left: 0, right: 0 };
     var firing = false;
 
@@ -326,7 +330,21 @@
             key: spec.key, code: spec.key, keyCode: spec.code, which: spec.code,
             bubbles: true, cancelable: true
         });
+        // 关键：KeyboardEvent 构造函数不接收 keyCode/which，必须强制重定义。
+        // 游戏引擎（c2runtime）用 e.which 检测按键——之前只定义了 keyCode、
+        // 漏了 which，导致方向键的 which 恒为 0、转向键完全无效（「愣住」根因）。
         try { Object.defineProperty(ev, 'keyCode', { get: function () { return spec.code; } }); } catch (e) {}
+        try { Object.defineProperty(ev, 'which', { get: function () { return spec.code; } }); } catch (e) {}
+        document.dispatchEvent(ev);
+    }
+    function sendFireKey(down) {
+        var ev = new KeyboardEvent(down ? 'keydown' : 'keyup', {
+            key: FIRE_KEY.key, code: FIRE_KEY.domCode,
+            keyCode: FIRE_KEY.code, which: FIRE_KEY.code,
+            bubbles: true, cancelable: true
+        });
+        try { Object.defineProperty(ev, 'keyCode', { get: function () { return FIRE_KEY.code; } }); } catch (e) {}
+        try { Object.defineProperty(ev, 'which', { get: function () { return FIRE_KEY.code; } }); } catch (e) {}
         document.dispatchEvent(ev);
     }
     function sendMouse(type, x, y) {
@@ -339,9 +357,17 @@
     function applyAction(a) {
         if (!a || !a.keys) return;
         var k = a.keys;
+        var locked = !!a.lock;
         ['up', 'down', 'left', 'right'].forEach(function (name) {
             var want = k[name] ? 1 : 0;
-            if (want !== held[name]) {
+            if (locked) {
+                // 接管（僵直）：每帧强制同步到 AI 期望状态。
+                // want=1 → 每帧发 keydown，want=0 → 每帧发 keyup，用比玩家
+                // 键盘重复（~30ms）更高的频率（~15ms）覆盖玩家真实输入，
+                // 实现「玩家 ⬆⬇⬅➡ 均无法操作」。
+                sendKey(name, want === 1);
+                held[name] = want;
+            } else if (want !== held[name]) {
                 sendKey(name, want === 1);
                 held[name] = want;
             }
@@ -355,7 +381,8 @@
             if (!debugRxLogged) { debugRxLogged = true; console.log('DEBUG rx: action without debug (visualize off?)'); } }
         var wantFire = a.fire ? 1 : 0;
         if (wantFire !== firing) {
-            sendMouse(wantFire ? 'mousedown' : 'mouseup', a.mx || 0, a.my || 0);
+            // 开火走游戏原生 P1 键盘绑定（M 键），鼠标事件不可靠（v3 实测）
+            sendFireKey(wantFire === 1);
             firing = wantFire;
         }
     }
@@ -557,7 +584,7 @@
             if (held[n]) { sendKey(n, false); }
             held[n] = 0;
         });
-        if (firing) { sendMouse('mouseup', 0, 0); firing = false; }
+        if (firing) { sendFireKey(false); firing = false; }
     }
     function tick() {
         var r = rt();

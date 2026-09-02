@@ -16,7 +16,8 @@ MIN_ACCEPT_PATH_PX = 100.0              # 只接受 ≥100px 的规划路径（�
 
 # ---------------- OODA / 规划节奏 ----------------
 OODA_PERIOD_S = 0.50                    # 常规重规划 2Hz，减少高速时目标滞后
-LOCAL_WINDOW_RETRY_S = 0.05             # 进入窗口尾段后 20Hz 快速续接
+LOCAL_WINDOW_RETRY_S = 0.20             # 窗口尾段续接 5Hz（原 0.05=20Hz 太重：每次
+                                        # replan 1.3ms×swept 校验，20Hz 累计 CPU 高 → 延时）
 WINDOW_REPLAN_FRACTION = 0.65           # 剩余 65% 窗口时开始预取下一段路径
 DEFAULT_PREDICTION_HORIZON_S = 0.0      # 敌方卡尔曼预测时域（0=关）
 

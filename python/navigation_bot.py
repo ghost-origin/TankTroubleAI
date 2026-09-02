@@ -26,6 +26,7 @@ from navigation_mvp import (
     tank_footprint_corners,
 )
 from kalman_path_predictor import ConstantVelocityKalman2D
+from combat_ai import CombatController
 
 # 全部可调参数集中在 bot_config.py（路点间距 / OODA / PID / 速度 / 旋转 / 滞回等）
 from bot_config import *   # noqa: F401,F403
@@ -135,6 +136,13 @@ class Bot:
         self.me_predictor = ConstantVelocityKalman2D()
         self.foe_predictor = ConstantVelocityKalman2D()
 
+        # 自动瞄准射击（独立模块，不修改导航逻辑）：
+        # 每帧在导航 action 之后做一次射击判定——若存在能直瞄/反弹命中敌人
+        # 的发射角，则暂停导航、进入射击模式（停车 + 转向瞄准 + 开火）。
+        self.combat = CombatController()
+        self.combat_enabled = True
+        self.last_bullets = []
+
         # 文件覆盖信号：launcher 每次收到桥的新局事件就覆盖写 round_reset.csv，
         # bot 发现内容变化 → 立即清理本轮数据开始新轮（进程永不重启）。
         # 启动时读一次做基线：旧会话残留的旧信号不触发。
@@ -237,7 +245,7 @@ class Bot:
 
     @staticmethod
     def stop_action():
-        return {'keys': {'up':0,'down':0,'left':0,'right':0}, 'fire':0}
+        return {'keys': {'up':0,'down':0,'left':0,'right':0}, 'fire':0, 'lock':0}
 
     def finish_round(self, reason):
         if self.round_ended:
@@ -394,6 +402,9 @@ class Bot:
         self.last_me = None
         self.last_foe = None
         self.last_foe_anim = ''
+        # 自动瞄准状态跨轮复位：新局清掉旧瞄准角/开火冷却
+        self.combat.reset()
+        self.last_bullets = []
         # 固定文件名：新局覆盖重写（从 0 开始），bot 常驻不杀进程
         self.round_no += 1
         self.track_path = os.path.join(self.out_dir, 'track.csv')
@@ -519,9 +530,13 @@ class Bot:
         }
         self.w.writerow(row)
         self.lw.writerow(row)      # 同步写"当前轮"track_latest.csv
-        self.f.flush()
-        self.lf.flush()
         self.rows += 1
+        # 磁盘 I/O 节流：每 30 帧才 flush 一次（30Hz 下 ≈ 每秒 1 次）。
+        # 每帧 2 次 flush 是"偶发导航延时"的帮凶：系统磁盘忙时 flush 会
+        # 从 0.2ms 飙到几十 ms（杀软扫描/后台写盘），直接卡住单线程 bot。
+        if self.rows % 30 == 0:
+            self.f.flush()
+            self.lf.flush()
 
     def _dense_lookahead(self, me):
         """纯追踪前瞻点（备用模式）：密集路径上找距车最近的点，再沿路径前进
@@ -1108,6 +1123,7 @@ class Bot:
         self.last_me = dict(me)
         self.last_foe = dict(foe)
         self.last_foe_anim = foe_anim
+        self.last_bullets = msg.get('bullets') or []
         self.me_predictor.update(t, me['x'], me['y'], me['vx'], me['vy'])
         self.foe_predictor.update(t, foe['x'], foe['y'], foe['vx'], foe['vy'])
         # 惰性文件：任何帧处理前确保本轮 track/plans 文件已创建
@@ -1131,6 +1147,25 @@ class Bot:
         if t - self.last_plan_t >= replan_period:
             self.replan(t, me, foe)
         action = self.action(me)
+        # ---- 自动瞄准射击判定层（独立模块，不修改上方任何导航逻辑）----
+        # combat.attack() 每帧求解：从炮口出发的直瞄/反射弹道能否命中敌人
+        # 预测位置。返回 lock=1（有可行射击角）或 lock=0（无）。
+        #   lock=1 → 暂停导航，进入射击模式：停车（up/down=0）+ 按 combat
+        #            的转向键瞄准 + 开火；桥端 lock=1 每帧强制同步键状态。
+        #   lock=0 → 保持上方导航 action 原样（fire=0）。
+        combat_act = self.combat.attack(t, me, foe, self.last_bullets, self.raw_wall) if self.combat_enabled else {'lock': 0}
+        if combat_act.get('lock'):
+            action = {
+                'keys': {'up': 0, 'down': 0,
+                         'left': combat_act['keys'].get('left', 0),
+                         'right': combat_act['keys'].get('right', 0)},
+                'fire': combat_act.get('fire', 0),
+                'lock': 1,
+            }
+            self.controller_mode = 'COMBAT_LOCK'
+        else:
+            action = dict(action)
+            action['lock'] = 0
         if self.visualize:
             action = dict(action)
             action['debug'] = self._debug_overlay()
@@ -1169,8 +1204,13 @@ if __name__ == '__main__':
                     help='terminate the bot process when a round ends (headless one-round-per-match mode)')
     ap.add_argument('--visualize', action='store_true',
                     help='send path/waypoint/swept-footprint overlay data to the bridge (web overlay)')
+    ap.add_argument('--no-combat', action='store_true',
+                    help='disable auto-aim shooting gate (pure navigation; used by headless benchmark)')
     a = ap.parse_args()
     bot = Bot(a.port, a.out_dir, a.repo, a.tactical_mode, a.prediction_horizon_s)
     bot.exit_on_round_end = a.exit_on_round_end
     bot.visualize = a.visualize
+    bot.combat_enabled = not a.no_combat
+    if bot.combat_enabled:
+        print('auto-aim shooting gate ENABLED（导航 + 可行射击角时暂停导航瞄准开火）', flush=True)
     bot.serve()
