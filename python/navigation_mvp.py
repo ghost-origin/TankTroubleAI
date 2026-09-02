@@ -24,6 +24,7 @@ import math
 import os
 import time
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -690,26 +691,118 @@ def footprint_collides(raw_wall: np.ndarray, x: float, y: float, heading: float,
     return False
 
 
+# ---------------- P1: swept 路径批量向量化碰撞 ----------------
+# 位级一致性策略（学自 P1/P2_GEOMETRY_OPTIMIZATION）：
+#   1) 世界坐标角点仍逐姿态调用 tank_footprint_corners —— 三角函数与运算
+#      顺序和标量版 bit-for-bit 一致（旋转缓存局部点数学等价，但浮点运算
+#      顺序不同，会在罕见的半像素边界取整到相邻像素）；
+#   2) 每边采样数仍逐姿态用 math.hypot 计算 —— 旋转后的世界边长浮点上可能
+#      比名义值长 1 ULP（20px 边可能 ceil 成 21），必须复刻标量的 ceil 结果；
+#   3) 只有繁重的插值/取整/索引工作向量化：按相同采样数分组，同组姿态
+#      共享同一份插值比例（lru_cache 缓存），一次广播完成全部边点。
+
+
+@lru_cache(maxsize=32)
+def _footprint_edge_fractions(sample_count: int) -> np.ndarray:
+    """缓存一条边的插值比例（0..1）。Python 除法复刻标量循环的 ``i / n``。"""
+    n = max(1, int(sample_count))
+    u = np.asarray([i / n for i in range(n + 1)], dtype=np.float64)
+    u.setflags(write=False)
+    return u
+
+
+def footprint_collides_batch(raw_wall: np.ndarray,
+                             poses: Sequence[Tuple[float, float, float]],
+                             edge_step: float = FOOTPRINT_EDGE_STEP_PX,
+                             shrink: float = 0.0,
+                             chunk_size: int = 128) -> np.ndarray:
+    """批量检查车体位姿（poses 形状 (N,3) = [x, y, heading]），返回 (N,) bool。
+
+    与逐点 footprint_collides 的边采样点、round 语义、越界策略完全一致
+    （见模块头注释的位级一致性策略）。按 chunk_size 个位姿分块，避免长路径
+    产生无界临时数组。返回逐位姿判定数组，调用方用 np.any() 汇总。
+    """
+    pose_array = np.asarray(poses, dtype=np.float64)
+    if pose_array.size == 0:
+        return np.zeros(0, dtype=np.bool_)
+    if pose_array.ndim != 2 or pose_array.shape[1] != 3:
+        raise ValueError("poses must have shape (N, 3)")
+
+    wall = np.asarray(raw_wall)
+    h, w = wall.shape
+    out = np.empty(pose_array.shape[0], dtype=np.bool_)
+    chunk = max(1, int(chunk_size))
+    step = max(float(edge_step), 1e-6)
+
+    for start in range(0, pose_array.shape[0], chunk):
+        p = pose_array[start:start + chunk]
+        # 复用原角点例程：三角函数与运算顺序与 P1 前实现位级对齐。
+        corners = np.asarray([
+            tank_footprint_corners(float(x), float(y), float(heading),
+                                   shrink=float(shrink))
+            for x, y, heading in p
+        ], dtype=np.float64)
+        chunk_hits = np.zeros(len(p), dtype=np.bool_)
+        for edge_index in range(4):
+            a = corners[:, edge_index, :]
+            b = corners[:, (edge_index + 1) % 4, :]
+            # 保留旧实现逐姿态的 ceil 结果：同采样数的姿态分组后，
+            # 昂贵的插值/索引保持向量化。
+            counts = np.asarray([
+                max(1, int(math.ceil(math.hypot(
+                    float(bb[0]) - float(aa[0]),
+                    float(bb[1]) - float(aa[1])) / step)))
+                for aa, bb in zip(a, b)
+            ], dtype=np.intp)
+            for sample_count in np.unique(counts):
+                pose_indices = np.flatnonzero(counts == sample_count)
+                u = _footprint_edge_fractions(int(sample_count))
+                aa = a[pose_indices]
+                bb = b[pose_indices]
+                world_x = aa[:, 0, None] + (
+                    bb[:, 0] - aa[:, 0])[:, None] * u[None, :]
+                world_y = aa[:, 1, None] + (
+                    bb[:, 1] - aa[:, 1])[:, None] * u[None, :]
+                # np.rint 与 Python round 同为 nearest, ties-to-even。
+                ix = np.rint(world_x).astype(np.intp)
+                iy = np.rint(world_y).astype(np.intp)
+                outside = (ix < 0) | (iy < 0) | (ix >= w) | (iy >= h)
+                ix_safe = np.clip(ix, 0, w - 1)
+                iy_safe = np.clip(iy, 0, h - 1)
+                chunk_hits[pose_indices] |= np.any(
+                    outside | wall[iy_safe, ix_safe], axis=1)
+        out[start:start + len(p)] = chunk_hits
+
+    return out
+
+
 def swept_rectangle_path_clear(path: Sequence[Point], raw_wall: np.ndarray,
                                shrink: float = 0.0) -> bool:
-    """沿中心线姿态检查车身 footprint；相邻姿态自适应补采样近似扫掠区。"""
+    """沿中心线姿态检查车身 footprint；相邻姿态自适应补采样近似扫掠区。
+
+    P1: 全部姿态（路径点 + 段间补采样）一次性收集，交给
+    footprint_collides_batch 批量检查 —— 与逐点版本结果完全一致。
+    """
     if len(path) < 2:
         return False
     headings = _path_headings(path)
-    for p, th in zip(path, headings):
-        if footprint_collides(raw_wall, p[0], p[1], th, shrink=shrink):
-            return False
+    poses = np.empty((len(path), 3), dtype=np.float64)
+    poses[:, 0] = [p[0] for p in path]
+    poses[:, 1] = [p[1] for p in path]
+    poses[:, 2] = headings
+    extra = []
     for a, b, ta, tb in zip(path, path[1:], headings, headings[1:]):
         move = _dist(a, b)
         turn_arc = abs(_wrap_rad(tb - ta)) * TANK_BODY_RADIUS_PX
         n = max(1, int(math.ceil(max(move, turn_arc) / FOOTPRINT_SWEEP_STEP_PX)))
         for i in range(1, n):
             u = i / n
-            p = _lerp(a, b, u)
-            th = ta + _wrap_rad(tb - ta) * u
-            if footprint_collides(raw_wall, p[0], p[1], th, shrink=shrink):
-                return False
-    return True
+            extra.append((a[0] + (b[0] - a[0]) * u,
+                          a[1] + (b[1] - a[1]) * u,
+                          ta + _wrap_rad(tb - ta) * u))
+    if extra:
+        poses = np.concatenate([poses, np.asarray(extra, dtype=np.float64)], axis=0)
+    return not bool(np.any(footprint_collides_batch(raw_wall, poses, shrink=shrink)))
 
 
 def min_curve_radius(path: Sequence[Point]) -> Optional[float]:
@@ -751,6 +844,74 @@ def footprint_clearance(path: Sequence[Point], free_dist: Optional[np.ndarray]) 
     return best if best != float("inf") else 0.0
 
 
+def footprint_clearances(paths: Sequence[Optional[Sequence[Point]]],
+                         free_dist: Optional[np.ndarray]) -> List[float]:
+    """一次批处理计算多条路径的车体最小间隙（P2）。
+
+    结果与逐条调用 footprint_clearance 完全一致：每条路径的全部航向角、
+    四个车体角点一次性向量化生成，拼接后做一次高级索引，再按路径分组
+    做最小值归约 —— 15 条 Bezier 候选从 15 次 Python 循环变成一次 NumPy 调用。
+    """
+    n_paths = len(paths)
+    if free_dist is None or n_paths == 0:
+        return [0.0] * n_paths
+    h, w = free_dist.shape
+    hl, hw = TANK_HALF_LENGTH_PX, TANK_HALF_WIDTH_PX
+    chunks_cx: List[np.ndarray] = []
+    chunks_cy: List[np.ndarray] = []
+    counts: List[int] = []
+    for path in paths:
+        if path is None or len(path) < 2:
+            counts.append(0)
+            continue
+        pts = np.asarray(path, dtype=np.float64)
+        n = len(pts)
+        x = pts[:, 0]
+        y = pts[:, 1]
+        head = np.empty(n, dtype=np.float64)
+        head[0] = math.atan2(y[1] - y[0], x[1] - x[0])
+        head[-1] = math.atan2(y[-1] - y[-2], x[-1] - x[-2])
+        if n > 2:
+            head[1:-1] = np.arctan2(y[2:] - y[:-2], x[2:] - x[:-2])
+        ca = np.cos(head)
+        sa = np.sin(head)
+        fx = ca * hl
+        fy = sa * hl
+        sx = -sa * hw
+        sy = ca * hw
+        cx = np.empty((n, 4), dtype=np.float64)
+        cy = np.empty((n, 4), dtype=np.float64)
+        cx[:, 0] = x + fx - sx
+        cy[:, 0] = y + fy - sy
+        cx[:, 1] = x + fx + sx
+        cy[:, 1] = y + fy + sy
+        cx[:, 2] = x - fx + sx
+        cy[:, 2] = y - fy + sy
+        cx[:, 3] = x - fx - sx
+        cy[:, 3] = y - fy - sy
+        chunks_cx.append(cx.reshape(-1))
+        chunks_cy.append(cy.reshape(-1))
+        counts.append(n * 4)
+    if not chunks_cx:
+        return [0.0] * n_paths
+    all_cx = np.concatenate(chunks_cx)
+    all_cy = np.concatenate(chunks_cy)
+    ix = np.rint(all_cx).astype(np.intp)
+    iy = np.rint(all_cy).astype(np.intp)
+    np.clip(ix, 0, w - 1, out=ix)
+    np.clip(iy, 0, h - 1, out=iy)
+    vals = free_dist[iy, ix]
+    out: List[float] = []
+    pos = 0
+    for cnt in counts:
+        if cnt == 0:
+            out.append(0.0)
+        else:
+            out.append(float(vals[pos:pos + cnt].min()))
+            pos += cnt
+    return out
+
+
 def _legacy_tube_coarse_ok(path: Sequence[Point], free_dist: Optional[np.ndarray]) -> bool:
     """旧 Virtual Tube 只作为极粗过滤：中心线不能贴墙或越界。"""
     if free_dist is None:
@@ -781,7 +942,9 @@ def build_tube(path: Sequence[Point], free_dist: Optional[np.ndarray],
     # 扫掠验证移到组合循环外：先按成本排序（评分便宜），再按成本序扫掠，
     # 第一个通过即返回 —— 与"扫掠通过的候选中取最小成本"完全等价，
     # 常见情形只跑 1 次扫掠（原 15 次）。
-    ranked = []
+    # P2: 15 组候选的间隙计算（footprint_clearance）合并为一次 NumPy 批处理，
+    # 代价评分语义与逐条计算完全一致（soft_clearance_penalty 精确保留）。
+    candidates: List[List[Point]] = []
     for radius_scale in (1.25, 1.1, 1.45, 0.95, 1.7):
         for handle_scale in (1.0, 0.85, 1.15):
             candidate = _bezier_polyline(path, TUBE_SAMPLE_STEP, radius_scale, handle_scale)
@@ -793,11 +956,16 @@ def build_tube(path: Sequence[Point], free_dist: Optional[np.ndarray],
             # 真实车体间隙只剩 1-2px（arena goal 尾帧 clear=11.2 的碰撞根源）。
             # 对曲线再推一次，保证中心线 clearance ≥ TUBE_MIN_CLEARANCE。
             candidate = push_off_walls(candidate, free_dist, min_clearance=TUBE_MIN_CLEARANCE)
-            clear = footprint_clearance(candidate, free_dist)
-            soft_clearance_penalty = max(0.0, clearance - clear) * 20.0
-            cost = path_length(candidate) + smoothness(candidate) * 18.0
-            cost += curvature_variation(candidate) * 10.0 + soft_clearance_penalty
-            ranked.append((cost, candidate))
+            candidates.append(candidate)
+    if not candidates:
+        return None
+    clears = footprint_clearances(candidates, free_dist)
+    ranked = []
+    for candidate, clear in zip(candidates, clears):
+        soft_clearance_penalty = max(0.0, clearance - clear) * 20.0
+        cost = path_length(candidate) + smoothness(candidate) * 18.0
+        cost += curvature_variation(candidate) * 10.0 + soft_clearance_penalty
+        ranked.append((cost, candidate))
     if not ranked:
         return None
     ranked.sort(key=lambda item: item[0])
@@ -1121,7 +1289,6 @@ def plan(me: Point, foe: Point, foe_angle: float, raw_wall: np.ndarray, blocked:
     # 目标滞回：敌人小幅移动（< TARGET_SWITCH_DISTANCE_PX）时沿用上一轮
     # 目标，避免目标抖动引发 A/B 双路跳变（路口反复掉头）。
     if tactical_mode == TACTICAL_MODE_CHASE:
-        ms = (time.perf_counter() - begin) * 1000.0
         goal = foe
         if (preferred_target is not None and
                 math.hypot(foe[0] - preferred_target[0], foe[1] - preferred_target[1])
@@ -1130,12 +1297,12 @@ def plan(me: Point, foe: Point, foe_angle: float, raw_wall: np.ndarray, blocked:
         foe_c = point_to_cell(goal, grid_px, blocked)
         foe_free = nearest_free(foe_c, blocked, max_r=8)
         if foe_free is None:
-            return PlanResult(False, [], foe, None, 0, 0, ms,
+            return PlanResult(False, [], foe, None, 0, 0, (time.perf_counter()-begin)*1000.0,
                               reason="chase_goal_blocked", tactical_mode=tactical_mode,
                               target_type="chase", path_source="chase")
         p_cells = astar(start, foe_free, blocked)
         if not p_cells:
-            return PlanResult(False, [], foe, None, 0, 0, ms,
+            return PlanResult(False, [], foe, None, 0, 0, (time.perf_counter()-begin)*1000.0,
                               reason="chase_no_path", tactical_mode=tactical_mode,
                               target_type="chase", path_source="chase")
         p_cells = simplify_cells(p_cells, blocked)
@@ -1147,19 +1314,19 @@ def plan(me: Point, foe: Point, foe_angle: float, raw_wall: np.ndarray, blocked:
         if free_dist is None:
             # 无距离场时退回网格路径（无足迹验证）
             L = path_length(p)
-            return PlanResult(True, p, foe, None, L, smoothness(p), ms,
+            return PlanResult(True, p, foe, None, L, smoothness(p), (time.perf_counter()-begin)*1000.0,
                               reason="chase", tactical_mode=tactical_mode,
                               target_type="chase", path_source="chase",
                               path_validated=True, validation_reason="grid_only_no_footprint",
                               raw_path_points=raw_path_points, executed_path_points=len(p))
         if window is None:
-            return PlanResult(False, [], foe, None, 0, 0, ms,
+            return PlanResult(False, [], foe, None, 0, 0, (time.perf_counter()-begin)*1000.0,
                               reason="chase_tube_invalid", tactical_mode=tactical_mode,
                               target_type="chase", path_source="chase",
                               validation_reason="tube_invalid", raw_path_points=raw_path_points)
         path = window.path
         L = path_length(path)
-        return PlanResult(True, path, foe, None, L, smoothness(path), ms,
+        return PlanResult(True, path, foe, None, L, smoothness(path), (time.perf_counter()-begin)*1000.0,
                           reason="chase", tactical_mode=tactical_mode,
                           target_type="chase", path_source="chase",
                           path_validated=True, validation_reason=window.validation_reason,
