@@ -65,6 +65,10 @@ CORNER_SPEED = GAME_MAX_SPEED_PX_S      # 兼容旧工具：弯道不再主动�
 CORNER_MIN_SPEED = GAME_MAX_SPEED_PX_S
 CORNER_LOOKAHEAD_PX = 60.0              # 曲率前瞻窗口
 STEER_SPEED_PX_S = 3.8                  # 游戏转向速率（rad/s，实测值）
+TURN_BRAKE_RAD = 2.5                    # 急弯降速转向阈值（rad/s）：|w_des| 超过此值
+                                        # 时打舵帧松开油门，让游戏速度 s 衰减，触发物理
+                                        # "低速转向保底" → 转弯半径从 33px 缩到 ~20px 级；
+                                        # 0 = 关闭（始终全速转向，R 恒 33px）
 
 # ---------------- 原地旋转（无路线时） ----------------
 SPIN_SIDE_SIN_THRESHOLD = 0.15          # 选向阈值：|sinθ|>0.15（≈8.6°）时朝敌所在侧转

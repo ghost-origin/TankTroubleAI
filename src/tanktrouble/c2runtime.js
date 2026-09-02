@@ -35539,11 +35539,21 @@ cr.behaviors.Car = function(runtime)
 		}
 		if (left && !right)
 		{
-			this.a = cr.clamp_angle(this.a - this.steerSpeed * dt * (Math.abs(this.s) / this.maxspeed));
+			// 低速/原地转向保底：真实 TankTrouble 支持原地转，但原物理把转向
+			// 角速度绑定在 |s|/maxspeed 上（s=0 → ω=0，转不动；前进中 R 恒 =
+			// maxspeed/steerSpeed ≈ 33px）。保底 0.5 后：s=0 时 ω=1.9rad/s 原地转；
+			// s<62.5px/s 时转向比例恒 0.5 → 转弯半径随速度线性缩小（R=s/1.9）。
+			var turnScale = Math.abs(this.s) / this.maxspeed;
+			if (turnScale < 0.5)
+				turnScale = 0.5;
+			this.a = cr.clamp_angle(this.a - this.steerSpeed * dt * turnScale);
 		}
 		if (right && !left)
 		{
-			this.a = cr.clamp_angle(this.a + this.steerSpeed * dt * (Math.abs(this.s) / this.maxspeed));
+			var turnScale = Math.abs(this.s) / this.maxspeed;
+			if (turnScale < 0.5)
+				turnScale = 0.5;
+			this.a = cr.clamp_angle(this.a + this.steerSpeed * dt * turnScale);
 		}
 		var recover = this.driftRecover * dt;
 		var diff = cr.angleDiff(this.a, this.m);

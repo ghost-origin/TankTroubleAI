@@ -1037,6 +1037,12 @@ class Bot:
             self._v_smooth += SPEED_MEAS_CORR * (speed_now - self._v_smooth)
         self._throttle_on = True
         k['up'] = 1
+        # 急弯降速转向：需要大角速度（|w_des| > TURN_BRAKE_RAD）时，打舵帧
+        # 松开油门 —— 游戏速度 s 衰减后触发物理"低速转向保底"（|s|/maxspeed
+        # 下限 0.5），转弯半径随速度线性缩小（R=s/1.9，33px → ~20px 级），
+        # 接近停车时近乎原地转。只对急弯生效，直线纠偏/普通弯不受影响。
+        if TURN_BRAKE_RAD > 0 and steer_on and abs(w_des) > TURN_BRAKE_RAD:
+            k['up'] = 0
 
         self.controller_mode = 'FULL_SPEED_PATH'
         return {'keys':k, 'fire':0}
