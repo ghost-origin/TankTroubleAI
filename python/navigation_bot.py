@@ -382,8 +382,12 @@ class Bot:
             maze_wall = None
             if self.maze_signature is not None:
                 maze_wall = sum(1 for row in self.maze_signature for v in row if v != 0 and v != -1)
-            los = self._los_clear_between(
-                (me.get('x'), me.get('y')), (foe.get('x'), foe.get('y')), self.raw_wall)
+            los = None
+            me_x = me.get('x'); me_y = me.get('y')
+            foe_x = foe.get('x'); foe_y = foe.get('y')
+            if None not in (me_x, me_y, foe_x, foe_y):
+                los = self._los_clear_between(
+                    (me_x, me_y), (foe_x, foe_y), self.raw_wall)
             # 最后两帧速度估算
             last_speed = None
             if len(self._rec_tail) >= 2:

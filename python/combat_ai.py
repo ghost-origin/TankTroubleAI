@@ -44,7 +44,10 @@ from kalman_path_predictor import ConstantVelocityKalman2D
 from bot_config import (USE_KALMAN_PREDICTOR,   # 敌方位置预测开关（bot_config.py）
                         CONF_FIRE_MIN_DIRECT, CONF_LOCK_MIN_DIRECT,
                         FIRE_MISS_MAX_DIRECT_PX, FIRE_COOLDOWN_S,
-                        RESOLVE_EVERY_S, LOCK_RELEASE_COOL_S)   # 火控门槛/节奏（bot_config.py）
+                        RESOLVE_EVERY_S, LOCK_RELEASE_COOL_S,   # 火控门槛/节奏
+                        COMBAT_MAX_BOUNCES, BOUNCE_CONF_DECAY,   # 反射深度/衰减权重
+                        REFINE_DEADBAND_DEG, REFINE_MAX_DEG,
+                        REFINE_BRAKE_MAX)                        # 发射后收敛
 
 Point = Tuple[float, float]
 
@@ -71,12 +74,14 @@ BASE_SHELL_SPEED_PX_S = 360.0          # 原版全速子弹初速（实测峰值
 DEFAULT_SHELL_SPEED_PX_S = BASE_SHELL_SPEED_PX_S * CONFIG_SHELL_MULTIPLIER
 
 # 弹道模拟
-MAX_BOUNCES = 2            # 最多反射次数（与游戏原版 AI 一致：normal=1 / hard=2）。
-                           # 之前设 4 会把「3~4 次边框反弹扫过目标」误判为命中，
-                           # 导致 AI 朝几乎错误的方向乱开火（炮弹乱弹自伤）。
+# 反射次数上限 → bot_config.COMBAT_MAX_BOUNCES（=3；原 2）：多算一次反射，
+# 视野更远（拐角/贴墙机会更多）。历史上设 4 会误判命中乱射——那是 30px 命中
+# 半径 + 无"命中点→目标无墙"把关的年代，现已被 18.45 命中半径 + 墙段把关 +
+# leg1 否决 + 发射前 ±3° 偏差推演替代，3 次是安全的。
+MAX_BOUNCES = COMBAT_MAX_BOUNCES
 MAX_PATH_PX = 760.0 * CONFIG_SHELL_MULTIPLIER   # 炮弹最大总路程（≈初速 × 2.1s，
                                                 # 按实际配置弹速缩放）
-STEP_PX = 1.0              # 光线步长（像素）
+STEP_PX = 1.0              # 光线步长（像素）——开火验证路径保持 1px 全精度
 HIT_RADIUS_PX = 18.45      # 命中判定：弹道对目标的最小距离 ≤ 此值（= 敌方坦克真实
                             # 碰撞盒 31×20 的外接圆半径 sqrt(15.5²+10²)）。原 30px 过宽：
                             # miss 20~30px 的"擦边命中"物理上打不中坦克，导致发射后子弹
@@ -129,6 +134,12 @@ U_TURN_LOCK_RAD = math.pi - 0.35       # 接近 180° 掉头时锁定转向方�
 FIRE_PULSE_S = 0.10                    # 按键脉冲时长
 # 开火冷却 / 重扫周期 / 交还冷却 → bot_config.py（FIRE_COOLDOWN_S / RESOLVE_EVERY_S /
 # LOCK_RELEASE_COOL_S），可运行中调参不改这里。
+# ---- 发射后微调（渐近收敛）----
+# 每发射击后以"当前车头朝向"为基准做局部 miss 最小化（±RECENTER_SPAN_RAD、
+# FINE_STEP_RAD 步进），把 aim 更新为该局部中心 → 下一发从更靠近命中窗中心的
+# 角度打出去，1/2/3 次反射逐发收紧（直射同样受益）。
+RECENTER_SPAN_RAD = math.radians(3.0)  # 微调搜索范围（±3°）
+RECENTER_PAD_S = 0.02                  # 开火脉冲结束后再动 aim（防脉冲被中断）
 
 # ---- 机会发现扫描（触发方式 B 参数）----
 COARSE_STEP_DEG = 15.0             # 粗扫步长：24 条射线覆盖全圆，相位对齐"敌-我连线"
@@ -140,6 +151,14 @@ REFINE_SPAN_DEG = 10.0             # 命中处细化/角裕度走查范围（±1
 REFINE_STEP_DEG = 1.0
 REFINE_MAX_CENTERS = 6             # 最多细化几个粗扫命中角（按命中质量取前 N，控射线总量）
 TRIGGER_CURRENT_SPAN_DEG = 10.0    # 触发方式 A 的角裕度走查范围（±10°）
+
+# ---- F-2 扫描缓存（几何自适应降频）----
+# 双方位置（及车头角）几乎没变 → solve 结果必然不变 → 跳过重算（周期顺延，
+# 上限 SCAN_SKIP_MAX_S）。= "只在几何变化时重扫"：静止/远离时省整次扫描，
+# 运动/接近时保持 RESOLVE_EVERY_S 满速，发现时机零损失。
+SCAN_QUIET_PX = 12.0             # 位置曼哈顿位移 < 此值视为"几何没变"
+SCAN_QUIET_HEADING_RAD = math.radians(3.0)   # 车头角变化 < 此值（conf 的 turn 项）
+SCAN_SKIP_MAX_S = 0.5            # 缓存最长有效时长（静止时扫描周期顺延上限）
 FIRE_MISS_MAX_PX = 15.0                # 反射解发射时弹道离目标中心 ≤ 此值才打（直射
                                         # 解用 bot_config.FIRE_MISS_MAX_DIRECT_PX=18.45）：
                                         # 坦克内切圆半径 10px（31×20 矩形任何方向距中心
@@ -177,7 +196,10 @@ CONF_FIRE_MIN = 0.50        # 开火门槛：C 低于此值不开火（宁可不
                             # conf_low 干等拦截（站桩等 foe 动），放宽减少犹豫失败。
                             # 且 conf < 门槛的解不再锁为 aim（见 attack：锁低 conf
                             # aim = 干等 + 重扫换解时 aim 大跳反向转）。
-CONF_SWITCH_MARGIN = 0.15   # 换瞄准角：新解 C 需比旧解高出此值才切换
+CONF_SWITCH_MARGIN = 0.15   # （弃用）换瞄准角阈值——已被"aim 冻结"策略取代
+CONF_SELECT_EPS = 0.05      # 解选择决胜带：conf 差距 ≤ 此值时用 (反射数, miss)
+                            # 决胜（弹道确定性优先）——防"转向快/路程甜点"把
+                            # 明显更准的直射（miss=0 但需转 90°）挤下去
 MARGIN_FULL_DEG = 12.0      # margin 满分刻度：≥12° 记满分
 DIST_OPT_PX = 180.0         # 最优弹道距离（待实测标定）
 DIST_SIGMA_PX = 120.0       # 距离容忍宽度
@@ -222,7 +244,27 @@ def estimate_shell_speed(bullets: Sequence[Dict]) -> float:
     return vals[len(vals) // 2]
 
 
-def _reflect_dir(wall: np.ndarray, ix: int, iy: int,
+_wall_flat_cache: Dict[int, Tuple[bytes, np.ndarray]] = {}
+
+
+def _wall_flat(wall: np.ndarray) -> Tuple[bytes, int, int]:
+    """墙掩码 → 行主序 bytes（按数组 id 一次性缓存）。
+
+    热循环里 `wall[iy, ix]`（numpy 标量索引）每次装箱成 Python bool，比
+    bytes 原生 int 索引慢 5~10 倍。锁图/换图会生成新数组对象 → 缓存自动失效。
+    """
+    key = id(wall)
+    ent = _wall_flat_cache.get(key)
+    if ent is not None and ent[1] is wall:
+        return ent[0], wall.shape[1], wall.shape[0]
+    b = np.ascontiguousarray(wall, dtype=np.uint8).tobytes()
+    if len(_wall_flat_cache) > 12:
+        _wall_flat_cache.clear()
+    _wall_flat_cache[key] = (b, wall)
+    return b, wall.shape[1], wall.shape[0]
+
+
+def _reflect_dir(wf: bytes, w: int, h: int, ix: int, iy: int,
                  px: float, py: float, dx: float, dy: float) -> Tuple[float, float]:
     """镜面反射：返回 (dx, dy) 反射后的方向。
 
@@ -231,11 +273,10 @@ def _reflect_dir(wall: np.ndarray, ix: int, iy: int,
     - 条的「端点/角」（只有一侧邻居）按射线主导轴翻转（先撞到哪个面翻哪个轴），
       修正端点判错导致弹道方向不变、直接穿透薄墙的穿墙 bug；
     - 十字交点 / 孤点按进入棱边判定，最后退回全翻转。
+    wf = 墙掩码行主序 bytes（wf[cy*w+cx]），w/h = 掩码宽高。
     """
-    h, w = wall.shape
-
     def at(cx: int, cy: int) -> bool:
-        return 0 <= cx < w and 0 <= cy < h and wall[cy, cx]
+        return 0 <= cx < w and 0 <= cy < h and wf[cy * w + cx] != 0
 
     n, s = at(ix, iy - 1), at(ix, iy + 1)
     e, ww = at(ix + 1, iy), at(ix - 1, iy)
@@ -335,12 +376,12 @@ def simulate_ray(wall: np.ndarray, x0: float, y0: float, angle: float,
     刚出膛及反弹绕回炮口附近的一小段，避免目标落在炮口旁时任何朝向都被
     误判为命中。
     """
-    h, w = wall.shape
+    wf, w, h = _wall_flat(wall)   # 行主序 bytes：热循环墙索引 5~10 倍提速（数值优化 A）
     dx, dy = math.cos(angle), math.sin(angle)
 
     # 起点若在墙内（贴墙瞄准的极端情况），沿反方向退到空地上
     x, y = x0, y0
-    while 0 <= int(round(y)) < h and 0 <= int(round(x)) < w and wall[int(round(y)), int(round(x))]:
+    while 0 <= int(round(y)) < h and 0 <= int(round(x)) < w and wf[int(round(y)) * w + int(round(x))]:
         x -= dx
         y -= dy
         if math.hypot(x - x0, y - y0) > 24.0:
@@ -367,10 +408,12 @@ def simulate_ray(wall: np.ndarray, x0: float, y0: float, angle: float,
         x += dx * STEP_PX
         y += dy * STEP_PX
         total += STEP_PX
-        ix, iy = int(round(x)), int(round(y))
-        if not (0 <= iy < h and 0 <= ix < w):
+        # 数值优化 B：round→int(x+0.5)（地图坐标全程 ≥ -0.5，出界由下方护栏兜住）
+        ix = int(x + 0.5)
+        iy = int(y + 0.5)
+        if iy >= h or ix >= w or iy < 0 or ix < 0:
             break  # 飞出迷宫（真实迷宫有边框墙，合成测试无边框时到此为止）
-        if wall[iy, ix]:
+        if wf[iy * w + ix]:
             if bounced >= max_bounces:
                 break
             if total - last_wall_total < WALL_MIN_GAP_PX:
@@ -378,7 +421,7 @@ def simulate_ray(wall: np.ndarray, x0: float, y0: float, angle: float,
             last_wall_total = total
             if bounced == 0:
                 leg1 = total              # 首个反射点路程（撞墙瞬间，未含推开量）
-            dx, dy = _reflect_dir(wall, ix, iy, last_sample[0], last_sample[1], dx, dy)
+            dx, dy = _reflect_dir(wf, w, h, ix, iy, last_sample[0], last_sample[1], dx, dy)
             bounced += 1
             x += dx * WALL_LOOKAHEAD_PX
             y += dy * WALL_LOOKAHEAD_PX
@@ -398,21 +441,30 @@ def simulate_ray(wall: np.ndarray, x0: float, y0: float, angle: float,
                 points.append((x, y))
                 return ShotSolution(angle, bounced, total, float('inf'), points,
                                     self_clear=min_self, hit_self=True, leg1=leg1)
-        if (int(total) % 2 == 0 and total >= min_dist_px
-                and math.hypot(x - x0, y - y0) >= min_dist_px):
-            points.append((x, y))
-            d = math.hypot(x - target[0], y - target[1])
-            if d < min_miss:
-                min_miss = d
-                min_miss_pt = (x, y)
-            if min_miss <= target_radius and hit_bounces is None:
-                hit_bounces = bounced
-                hit_len = total
-            if me_center is not None and hit_bounces is None:
-                # 只统计命中前路段：命中后炮弹已消失，回飞段不计入自伤
-                ds = math.hypot(x - me_center[0], y - me_center[1])
-                if ds < min_self:
-                    min_self = ds
+        if (int(total) % 2 == 0 and total >= min_dist_px):
+            # 数值优化 B：hypot → sqrt(dx²+dy²)
+            dmx = x - x0
+            dmy = y - y0
+            if dmx * dmx + dmy * dmy >= min_dist_px * min_dist_px:
+                points.append((x, y))
+                tx0 = target[0]
+                ty0 = target[1]
+                dtmx = x - tx0
+                dtmy = y - ty0
+                d = math.sqrt(dtmx * dtmx + dtmy * dtmy)
+                if d < min_miss:
+                    min_miss = d
+                    min_miss_pt = (x, y)
+                if min_miss <= target_radius and hit_bounces is None:
+                    hit_bounces = bounced
+                    hit_len = total
+                if me_center is not None and hit_bounces is None:
+                    # 只统计命中前路段：命中后炮弹已消失，回飞段不计入自伤
+                    dsmx = x - me_center[0]
+                    dsmy = y - me_center[1]
+                    ds = math.sqrt(dsmx * dsmx + dsmy * dsmy)
+                    if ds < min_self:
+                        min_self = ds
 
     if min_miss <= target_radius:
         # 命中结算把关：最小距离点到目标中心的连线必须无墙（目标盘与墙重叠时，
@@ -433,7 +485,7 @@ def trace_beam(wall: np.ndarray, x0: float, y0: float, angle: float,
     （含墙面镜面反射），每 ~6px 一点 + 反射点。不判命中、不判自伤——
     纯实时预览，负载轻；开火安全由 ±3° 三次推演负责。
     """
-    h, w = wall.shape
+    wf2, w2, h2 = _wall_flat(wall)   # 行主序 bytes
     dx, dy = math.cos(angle), math.sin(angle)
     x, y = x0, y0
     out: List[Point] = [(x, y)]
@@ -444,14 +496,15 @@ def trace_beam(wall: np.ndarray, x0: float, y0: float, angle: float,
         x += dx * STEP_PX
         y += dy * STEP_PX
         travelled += STEP_PX
-        ix, iy = int(round(x)), int(round(y))
-        if not (0 <= iy < h and 0 <= ix < w):
+        ix = int(x + 0.5)
+        iy = int(y + 0.5)
+        if iy >= h2 or ix >= w2 or iy < 0 or ix < 0:
             break
-        if wall[iy, ix]:
+        if wf2[iy * w2 + ix]:
             if bounced >= MAX_BOUNCES or travelled - last_wall_total < WALL_MIN_GAP_PX:
                 break
             last_wall_total = travelled
-            dx, dy = _reflect_dir(wall, ix, iy, x, y, dx, dy)
+            dx, dy = _reflect_dir(wf2, w2, h2, ix, iy, x, y, dx, dy)
             bounced += 1
             out.append((x, y))
             continue
@@ -485,7 +538,12 @@ def shot_confidence(sol: Optional[ShotSolution], margin_deg: float,
         return 0.0                      # 贴墙反弹否决：入射段过短，反弹方向不可预测
                                         # （模拟网格与游戏碰撞盒差 1~2px → 反弹偏 2°+，
                                         #  乱弹/弹回自伤温床）
-    c_bounce = 0.6 ** sol.bounces   # 反射惩罚：0=1.0, 1=0.6, 2=0.36（强鼓励直射）
+    # 反射衰减 → bot_config.BOUNCE_CONF_DECAY 查表（下标=反射次数：b0..b3 =
+    # 1.0/0.6/0.42/0.30 的柔和曲线，不是 0.6^n 等比；表外按 0.30 继续 ×0.6）。
+    if sol.bounces < len(BOUNCE_CONF_DECAY):
+        c_bounce = BOUNCE_CONF_DECAY[sol.bounces]
+    else:
+        c_bounce = BOUNCE_CONF_DECAY[-1] * 0.6 ** (sol.bounces - len(BOUNCE_CONF_DECAY) + 1)
     c_dist = math.exp(-((sol.path_len - DIST_OPT_PX) ** 2) / (2.0 * DIST_SIGMA_PX ** 2))
     c_turn = max(0.0, 1.0 - abs(turn_angle) / math.pi)
     c_margin = min(1.0, margin_deg / MARGIN_FULL_DEG)
@@ -542,11 +600,11 @@ def solve_shot(wall: np.ndarray, me: Dict, target: Point,
     且相位对齐"敌-我连线"保证直瞄窄窗恰在粗扫网格点上，不漏最值钱的机会）：
     - 15° 粗扫 24 条（网格相位 = 敌-我连线朝向）；
     - 无命中 → 5° 粗扫 72 条兜底（捕捉 15° 网格漏掉的窄反射窗）；
-    - 命中处 ±REFINE_SPAN_DEG 以 1° 走查（连续命中段 → 1° 命中字典，
-      供 margin 复用 + 捕捉网格点之间的命中细节），只细化命中质量前
-      REFINE_MAX_CENTERS 个，控制射线总量；
-    - 与旧实现同口径：按置信度 C 选最优（reflect 少 + miss 小 + margin 大），
-      再在最优角附近 ±2.5° 以 0.25° 细调对准目标中心。
+    - 细化（F-1：射线数对数化）——命中窗是同族（同反射次数）的连续角区间，
+      窗边用**二分搜索**定位（每边 ~8 条，取代 ±10° 1° 全走查的 ~20 条；
+      margin ≥ 12° 已满分 → 探到 ±REFINE_SPAN_DEG 仍命中即停，不再扩搜）；
+      只对命中质量前 REFINE_MAX_CENTERS 的中心做，每个中心用粗扫解估 conf，
+      选最优中心后仅对其 ±2.5° 以 0.25° 细调（21 条）对准目标中心。
 
     center_angle 保留仅作兼容（旧 ±90° 窗扫描已被全圆粗扫取代，不再影响扫描）。
     """
@@ -558,6 +616,14 @@ def solve_shot(wall: np.ndarray, me: Dict, target: Point,
     bearing_deg = math.degrees(math.atan2(target[1] - me_y, target[0] - me_x))
     base = int(round(bearing_deg))
 
+    def probe_deg(deg: float) -> Optional[ShotSolution]:
+        a = math.radians(deg)
+        x0 = me_x + math.cos(a) * MUZZLE_OFFSET_PX
+        y0 = me_y + math.sin(a) * MUZZLE_OFFSET_PX
+        s = simulate_ray(wall, x0, y0, a, target, me_center=me_center,
+                         tank=tank_pose)
+        return s if (s is not None and not s.hit_self) else None
+
     def coarse_pass(step_deg: float) -> List[int]:
         found: List[int] = []
         n = int(round(360.0 / step_deg))
@@ -565,12 +631,8 @@ def solve_shot(wall: np.ndarray, me: Dict, target: Point,
             i = (base + int(round(k * step_deg))) % 360
             if i in hits:
                 continue
-            a = math.radians(i)
-            x0 = me_x + math.cos(a) * MUZZLE_OFFSET_PX
-            y0 = me_y + math.sin(a) * MUZZLE_OFFSET_PX
-            sol = simulate_ray(wall, x0, y0, a, target,
-                               me_center=me_center, tank=tank_pose)
-            if sol is not None and not sol.hit_self:
+            sol = probe_deg(float(i))
+            if sol is not None:
                 hits[i] = sol
                 found.append(i)
         return found
@@ -582,45 +644,66 @@ def solve_shot(wall: np.ndarray, me: Dict, target: Point,
     if not found:
         return None
 
-    # 细化：命中处左右 ±REFINE_SPAN_DEG 以 1° 走查连续命中段
-    span_steps = int(round(REFINE_SPAN_DEG / REFINE_STEP_DEG))
+    # F-1 细化：二分查同族命中窗边界（对数射线），margin ≥ MARGIN_FULL_DEG 即满分
+    def same_family_hit(deg: float, family: int) -> bool:
+        s = probe_deg(deg)
+        return s is not None and s.bounces == family
+
+    def edge_from(center_deg: float, sign: float, family: int) -> float:
+        """从 center_deg 沿 sign 方向找同族命中窗边界（±REFINE_SPAN_DEG，0.06° 精度）。
+        探到边界外仍命中 → 窗比搜索窗宽（margin 已满分），直接返回搜索边界。"""
+        far = center_deg + sign * REFINE_SPAN_DEG
+        if same_family_hit(far, family):
+            return far
+        lo, hi = center_deg, far
+        for _ in range(8):
+            mid = (lo + hi) * 0.5
+            if same_family_hit(mid, family):
+                lo = mid
+            else:
+                hi = mid
+        return lo
+
     centers = sorted(found, key=lambda i: (hits[i].bounces, hits[i].miss,
                                            hits[i].path_len))[:REFINE_MAX_CENTERS]
-    for i0 in centers:
-        for sign in (1, -1):
-            for step in range(1, span_steps + 1):
-                i = (i0 + sign * step) % 360
-                if i in hits:
-                    continue
-                a = math.radians(i)
-                x0 = me_x + math.cos(a) * MUZZLE_OFFSET_PX
-                y0 = me_y + math.sin(a) * MUZZLE_OFFSET_PX
-                sol = simulate_ray(wall, x0, y0, a, target,
-                                   me_center=me_center, tank=tank_pose)
-                if sol is None or sol.hit_self:
-                    break
-                hits[i] = sol
-
-    # 按置信度 C 选最优（不再只比反射少/路程短——端点反射 margin≈0 被压低）
     best: Optional[ShotSolution] = None
     best_conf = -1.0
-    for i, sol in hits.items():
-        margin = _margin_deg(hits, i, sol.bounces)
-        turn = abs(wrap(math.radians(i) - me_angle))
-        conf = shot_confidence(sol, margin, turn, pred_sigma)
-        if conf > best_conf:
+    best_center = 0.0
+    best_margin = 0.0
+    for i0 in centers:
+        c0 = hits[i0]
+        l_edge = edge_from(float(i0), -1.0, c0.bounces)
+        r_edge = edge_from(float(i0), +1.0, c0.bounces)
+        margin = (r_edge - l_edge) + 1.0
+        turn = abs(wrap(math.radians(i0) - me_angle))
+        conf = shot_confidence(c0, margin, turn, pred_sigma)
+        better = False
+        if best is None:
+            better = True
+        elif conf > best_conf + CONF_SELECT_EPS:
+            better = True
+        elif conf >= best_conf - CONF_SELECT_EPS:
+            # 决胜带内：弹道确定性优先（更少反射 + 更小 miss）
+            better = ((c0.bounces, c0.miss) < (best.bounces, best.miss))
+        if better:
             best_conf = conf
-            best = sol
-            best.conf = conf
-            best.margin_deg = margin
+            best = c0
+            best_center = (l_edge + r_edge) * 0.5   # 窗中心（细调基准，比粗扫点更居中）
+            best_margin = margin
 
-    # 细调（保留）：在最优角附近 ±2.5° 微调对准目标中心，置信度沿用粗扫估计
+    if best is None:
+        return None
+
+    # 细调（保留）：绕窗中心 ±2.5° 微调对准目标中心；置信度沿用粗扫估计
     refined = best
     steps = int(round(FINE_SPAN_RAD / FINE_STEP_RAD))
     for k in range(-steps, steps + 1):
         if k == 0:
-            continue
-        a = best.angle + k * FINE_STEP_RAD
+            # 窗中心本身也探一发（它可能比粗扫点 miss 更小）
+            center_deg = best_center
+            a = math.radians(center_deg)
+        else:
+            a = math.radians(best_center) + k * FINE_STEP_RAD
         x0 = me_x + math.cos(a) * MUZZLE_OFFSET_PX
         y0 = me_y + math.sin(a) * MUZZLE_OFFSET_PX
         sol = simulate_ray(wall, x0, y0, a, target, me_center=me_center,
@@ -629,8 +712,8 @@ def solve_shot(wall: np.ndarray, me: Dict, target: Point,
             continue
         if (sol.bounces, sol.miss) < (refined.bounces, refined.miss):
             refined = sol
-    refined.conf = best.conf
-    refined.margin_deg = best.margin_deg
+    refined.conf = best_conf
+    refined.margin_deg = best_margin
     return refined
 
 
@@ -689,6 +772,43 @@ class CombatController:
         # 再 forecast(lead_t) 预测子弹命中时刻敌人的位置，车头直接瞄准预测点。
         self.kalman = ConstantVelocityKalman2D()
         self._kf_ready = False
+        # F-2 扫描缓存状态（几何没变时复用上一次 solve 结果）
+        self._solve_cache_key = None
+        self._solve_cache_t = -1e9
+        self._solve_cache_res = None
+        # 穿越开火一次机会开关：新锁定/新瞄准角 → 允许沿旋转路径截获一次
+        # 已验证命中（穿越开火）；开过一枪后关闭 → 转向恢复对准 aim（每发后由
+        # 发射后微调把 aim 拉到命中窗局部中心 → 第二发起误差渐近收敛）。
+        self._cross_armed = True
+        self._lock_shots = 0            # 本次锁定/瞄准内已发射数（1/2/3 次反射
+                                        # 逐发收紧的门控依据）
+        self._recenter_pending = False  # 开火脉冲结束后待执行的"发射后微调"
+        self._refine_phase = 0          # 收敛点动的占空比相位
+        self._brake_frames = 0          # 收敛制动帧计数（降速使单步变细）
+
+    def _solve_cached(self, t: float, me: Dict, target: Point,
+                      center_angle: Optional[float], pred_sigma: float,
+                      wall: np.ndarray) -> Optional[ShotSolution]:
+        """F-2：几何没变时复用上一次 solve_shot 结果（省整次扫描）。
+
+        缓存键 = (me 位置, me 朝向, 目标位置) 取整；命中且未超时 → 直接返回
+        上次结果（含 None——"无解"同样值得缓存，敌人没动时不会突然有解）。
+        """
+        if self._solve_cache_key is not None and t - self._solve_cache_t < SCAN_SKIP_MAX_S:
+            kx = self._solve_cache_key
+            if (abs(me['x'] - kx[0]) < SCAN_QUIET_PX and abs(me['y'] - kx[1]) < SCAN_QUIET_PX
+                    and abs(target[0] - kx[2]) < SCAN_QUIET_PX
+                    and abs(target[1] - kx[3]) < SCAN_QUIET_PX
+                    and abs(wrap(float(me.get('angle', 0.0)) - kx[4])) < SCAN_QUIET_HEADING_RAD):
+                return self._solve_cache_res
+        self._solve_cache_key = (float(me['x']), float(me['y']),
+                                 float(target[0]), float(target[1]),
+                                 float(me.get('angle', 0.0)))
+        self._solve_cache_t = t
+        self._solve_cache_res = solve_shot(wall, me, target,
+                                           center_angle=center_angle,
+                                           pred_sigma=pred_sigma)
+        return self._solve_cache_res
 
     # ------------------------------------------------------------------
     def attack(self, t: float, me: Dict, foe: Dict, bullets: Sequence[Dict],
@@ -871,9 +991,8 @@ class CombatController:
             if sol is None:
                 lead_t = min(MAX_LEAD_S, d0 / self.shell_speed)
                 target = predict_foe(lead_t)
-                sol = solve_shot(raw_wall, me, target,
-                                 center_angle=self.aim_angle,
-                                 pred_sigma=pred_sigma)
+                sol = self._solve_cached(t, me, target, self.aim_angle,
+                                         pred_sigma, raw_wall)
             # 近战特解（miss 0、conf 0.95）已最优且 foe 贴脸无 lead 意义：
             # 跳过第二段 lead 迭代（否则会被"绕远反射回环解"覆盖——贴脸 foe
             # 竟被解成 81° 绕场一周的反射，荒谬且慢）。
@@ -882,8 +1001,8 @@ class CombatController:
             if sol is not None and not near_mode:
                 lead_t = min(MAX_LEAD_S, sol.path_len / self.shell_speed)
                 target = predict_foe(lead_t)
-                sol2 = solve_shot(raw_wall, me, target, center_angle=sol.angle,
-                                  pred_sigma=pred_sigma)
+                sol2 = self._solve_cached(t, me, target, sol.angle,
+                                          pred_sigma, raw_wall)
                 if sol2 is not None:
                     sol = sol2
 
@@ -910,12 +1029,15 @@ class CombatController:
                 self.aim_angle = sol.angle
                 self.last_sol = sol
                 self.aim_conf = sol.conf
+                self._cross_armed = True    # 新瞄准角：重新给一次"穿越开火"机会
+                self._lock_shots = 0        # 新瞄准角：发射计数清零（收敛从第一发重新开始）
             else:
                 # 无新解：旧目标角仍可命中则保留，否则清除（交还）
                 if self.aim_angle is not None and can_hit(self.aim_angle) is None:
                     self.aim_angle = None
                     self.last_sol = None
                     self.aim_conf = 0.0
+                    self._cross_armed = True    # 交还后下个 lock 重新武装
 
         # 交还冷却期：刚因"打不出"交还过 → 短期内不重新接管（给导航脱困时间，
         # 否则交还一帧又锁上，等于没交还）
@@ -959,6 +1081,38 @@ class CombatController:
         # 真实发射角验证：当前车头朝向 me_angle 的弹道（前移到这里，供「穿越开火」
         # 与下方发射门共用一次计算，避免重复 can_hit 的两条射线）。
         fire_sol = can_hit(me_angle)
+        # ---- 发射后微调（渐近收敛，脉冲结束后执行一次）----
+        # 以当前车头朝向为基准做局部 miss 最小化（±3°，0.25° 步，≤25 条射线、
+        # 冷却期 ~3ms 一次性），把 aim 更新为该局部中心 —— 下一发从更居中的角度
+        # 打出，1/2/3 次反射与直射逐发收紧。找不到更优角（敌人已动走）→ 保持
+        # 原 aim，交给常规重扫更新。
+        if self._recenter_pending and t >= self.fire_until + RECENTER_PAD_S:
+            self._recenter_pending = False
+            if self.aim_angle is not None:
+                d0r = math.hypot(float(foe['x']) - me_x, float(foe['y']) - me_y)
+                tx_r, ty_r = predict_foe(min(MAX_LEAD_S, d0r / self.shell_speed))
+                best_r = None
+                r_steps = int(round(RECENTER_SPAN_RAD / FINE_STEP_RAD))
+                for k in range(-r_steps, r_steps + 1):
+                    if k == 0:
+                        continue   # 当前朝向已在 fire_sol 验证过
+                    a = me_angle + k * FINE_STEP_RAD
+                    x0r = me_x + math.cos(a) * MUZZLE_OFFSET_PX
+                    y0r = me_y + math.sin(a) * MUZZLE_OFFSET_PX
+                    sr = simulate_ray(raw_wall, x0r, y0r, a, (tx_r, ty_r),
+                                      me_center=(me_x, me_y),
+                                      tank=(me_x, me_y, me_angle))
+                    if sr is None or sr.hit_self:
+                        continue
+                    if sr.miss > (FIRE_MISS_MAX_DIRECT_PX if sr.bounces == 0
+                                  else FIRE_MISS_MAX_PX):
+                        continue   # 收敛目标必须是可发射质量
+                    if (best_r is None
+                            or (sr.bounces, sr.miss) < (best_r.bounces, best_r.miss)):
+                        best_r = sr
+                if best_r is not None:
+                    self.aim_angle = best_r.angle
+                    self.last_sol = best_r
         # ---- 穿越开火（fire-on-crossing）----
         # 诊断（fire_v3_diag 无头战斗）：锁定期间 77% 帧 why=no_hit（车头还在往
         # aim 转：err 中位 -8.3°、最大 103°），且 aim 会在解族间跳 ±53° → 车头
@@ -973,8 +1127,13 @@ class CombatController:
                                           if fire_sol.bounces == 0
                                           else FIRE_MISS_MAX_PX)
                     and t >= self.next_fire_t)
-        if crossing:
-            self.turn_dir = 0    # 已验证命中 → 停转，发射角确定（验证角 = 实际发射角）
+        if crossing and (self._cross_armed or t < self.fire_until):
+            # 已验证命中 → 停转，发射角确定（验证角 = 实际发射角）。
+            # _cross_armed 语义（"发射中微调射击角度"）：只在"本次瞄准还没开过
+            # 枪"（或仍在开火脉冲内）时冻结转向；一旦开过一枪，松绑 → 冷却期
+            # 按真实 err 朝 aim 中心（miss 最小解）旋转 → 第二发起误差渐近收敛
+            # （第一发 err≈-2° 也能打，第二发 |err|<1°）。
+            self.turn_dir = 0
             err = 0.0            # 发射门按"已对齐"处理（验证的就是实际发射弹道）
         # 停转窗口分叉：直射解（last_sol.bounces==0）用大窗口（易停稳），
         # 反射解用 2.5°（≥ 转向单步/2 → 一步可落窗，无极限环；原 0.8° ≪ 单步
@@ -994,8 +1153,33 @@ class CombatController:
             self._align_frames += 1          # 车头真的静止：累计帧数（与 err/aim 无关）
         else:
             self._align_frames = 0           # 车头在转（含惯性滑转）→ 清零
-        if abs(err) <= stop_rad:
+        # ---- 转向指令 ----
+        # 满舵逻辑（首枪前/误差大时）：停转窗 = 停转窗分叉（直射 3.5° / 反射 2.5°，
+        # ≥ 半步长，一步必落窗、无极限环——车没动 = 发射角确定）。
+        # 开火后（_lock_shots≥1）进入"收敛模式"：误差 ≤ REFINE_MAX_DEG 时不再满舵，
+        # 改为短促点动（占空比 ∝ 误差）+ down 制动降速 —— 引擎转向速率 ∝ 速度
+        # （c2runtime Car：steer×|s|/maxspeed，无油门仅 20px/s² 衰减），高速段一帧
+        # 4~7° 永远停不进窗中心；降到 ~35px/s 后单步 ≈1.1°，逐发误差收敛到
+        # REFINE_DEADBAND_DEG（1/2/3 次反射与直射同逻辑）。
+        if (self._lock_shots >= 1 and abs(err) <= math.radians(REFINE_MAX_DEG)
+                and t < self.next_fire_t):
+            if abs(err) <= math.radians(REFINE_DEADBAND_DEG):
+                self.turn_dir = 0          # 已收敛：停转等开火
+                self._brake_frames = 0
+            else:
+                self._refine_phase += 1
+                duty = max(0.25, min(1.0, abs(err) / math.radians(REFINE_MAX_DEG)))
+                period = max(1, int(round(1.0 / duty)))
+                if self._refine_phase % period == 0:
+                    self.turn_dir = 1 if err > 0 else -1   # 点动一帧
+                    if self._brake_frames < REFINE_BRAKE_MAX:
+                        out['keys']['down'] = 1            # 制动：单步随速度下降变细
+                        self._brake_frames += 1
+                else:
+                    self.turn_dir = 0
+        elif abs(err) <= stop_rad:
             self.turn_dir = 0
+            self._brake_frames = 0
         else:
             if self.turn_dir == 0 or abs(err) < U_TURN_LOCK_RAD:
                 self.turn_dir = 1 if err > 0 else -1
@@ -1073,8 +1257,12 @@ class CombatController:
                    and not leg_short
                    and fire_sol.miss <= miss_max_now
                    and self.aim_conf >= conf_min_now
-                   and abs(err) <= stop_fire
                    and self._align_frames >= frames_needed)
+        # 注意：不再要求 |err| ≤ stop_fire —— 弹道验证（fire_sol）基于实际车头角
+        # me_angle，err（相对 aim 的偏差）不参与弹道；角度确定性由"静止帧数"
+        # frames_needed 保证（车头没动 = 发射角确定）。原 err 门会把"瞄准角已由
+        # 发射后微调拉近、但车头尚差 2~3° 未到位"的合格枪全部掐掉 —— 这正是
+        # 反射解（窄窗 2.5°）逐发无法收敛的根因之一。aim 只负责指引转向方向。
         dev_ok = True
         if fire_ok and fire_sol is not None and fire_sol.bounces > 0:
             # 偏差安全验证（反射解）：实际发射角可能偏 ±FIRE_SAFE_DEV_RAD
@@ -1101,6 +1289,9 @@ class CombatController:
             self.next_fire_t = t + FIRE_COOLDOWN_S
             self.lock_since = t          # 开火成功 → 接管有效，超时重新计时
             self._lock_cool_until = -1e9
+            self._cross_armed = False    # 已开一枪：解除穿越冻结 → 转向由 aim 指引
+            self._lock_shots += 1        # 发射计数（本瞄准内第几发）
+            self._recenter_pending = True  # 脉冲结束后执行"发射后微调"（渐近收敛）
             print('FIRE conf=%.2f bounce=%d margin=%.1fdeg len=%.0f sigma=%.0f' % (
                 self.aim_conf, fire_sol.bounces,
                 getattr(self.last_sol, 'margin_deg', 0.0),
