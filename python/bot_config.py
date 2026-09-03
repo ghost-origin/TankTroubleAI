@@ -11,7 +11,7 @@ import math
 # ---------------- 调试数据记录总开关 ----------------
 # True：写 firelog/bullets/maze 按局存档/wall 时间戳等调试数据（排查用）；
 # False：关闭所有新增调试记录，只保留核心 track/plans/rounds（保证性能，减少磁盘 I/O）
-IS_DATA_LOG = True
+IS_DATA_LOG = False
 
 # ---------------- 路点与窗口 ----------------
 WAYPOINT_REACHED_PX = 13.0              # 路点到达判定距离：距路点 ≤13px 即推进
@@ -43,12 +43,26 @@ DEFAULT_PREDICTION_HORIZON_S = 0.0      # 敌方卡尔曼预测时域（0=关）
 
 # ---------------- 起步航向对准 ----------------
 # 停车起步（开局首条路径、窗口末端续接新路径）时：先原地旋转把车头对准路径
-# 入口切线，再踩油门 —— 避免边开边转的弧线起步（车头歪着起步会先横移一段）。
+# 切线，再踩油门 —— 避免边开边转的弧线起步（车头歪着起步会先横移一段）。
 # 旋转方向 = wrap(切线角 − 车头角)（等价于"车头向量 × 切线向量"叉积符号，自动取
 # 最短旋转方向：err>0 → 顺时针/right 键，err<0 → 逆时针/left 键，见游戏键约定）。
-# 行驶中不触发（Stanley 边走边纠）；仅车还在路径前段（wp_idx≤1）且近停时生效。
+# 行驶中不触发（Stanley 边走边纠）；仅车仍处于"起步段"且近停时生效。
+# "起步段"判定（方案二，动态弧长，不用 wp_idx —— wp_idx 受路点稀疏/跳过逻辑
+# 影响会从 1 漂到 2+，开局短路径下 ALIGN 永不触发 → 开局直冲的根因）：
+#   车在 dense 路径上距起点的弧长 ≤ start_align_arc_px 视为起步段。
+#   弧长阈值随执行窗口动态：长窗口起步段长，短窗口自动缩短。
+#   start_align_arc_px = max(WP_FIRST_MIN_PX*2, window_target_length * START_ALIGN_WINDOW_FRACTION)
 START_ALIGN_DEG = 10.0                  # 偏差超过此角度才先转（≤10° 直接走，Stanley 可纠）
 START_ALIGN_SPEED_PX_S = 25.0           # 车速低于此值视为"停车起步"场景
+START_ALIGN_WINDOW_FRACTION = 0.35      # 起步段占执行窗口长度的比例（窗口 160 → 56px）
+START_ALIGN_ARC_MIN_PX = WP_FIRST_MIN_PX * 3.0   # 起步段弧长下限（60px；短窗口/无窗口兜底）
+
+# 起步对准是一次性决策：静止起步时先转正，但只允许转 START_ALIGN_MAX_S；
+# 超时（转不动/被墙卡）立即放弃转正、直接放行油门 —— 消灭"原地瞎转"。
+# 对准成功(≤START_ALIGN_DEG)或超时后本段路径不再触发 ALIGN（行驶交给
+# Stanley；贴墙走不掉由 BLOCKED_ROTATE 脱困接力），杜绝"对准窗口被反复
+# 抢断 → 每脚油门 1~2px 蠕动"（r56 管道口卡死根因）。
+START_ALIGN_MAX_S = 1.5              # s，对准超时：超过立即放弃转正开走
 
 # ---------------- 转向控制（Stanley 横向控制器，借鉴斯坦福 DARPA 挑战赛） ----------------
 # 控制律：ω_des = FF·v·κ(s) + Kp·θe + Kd·dθe/dt − clamp(Kct·e_ct, ±CT_MAX)

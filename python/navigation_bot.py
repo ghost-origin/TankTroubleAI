@@ -130,6 +130,8 @@ class Bot:
         self.path = []
         self.dense_path = []
         self.wp_idx = 0
+        self._start_aligned = False      # 起步对准（一次性）跨轮清零
+        self._align_started_at = None
         self.current_plan_reason = ''
         self.current_relative_deg = None
         self.current_tactical_target = None
@@ -453,6 +455,8 @@ class Bot:
         self.path = []
         self.dense_path = []
         self.wp_idx = 0
+        self._start_aligned = False      # 起步对准（一次性）跨轮清零
+        self._align_started_at = None
         self.current_plan_reason = ''
         self.current_relative_deg = None
         self.current_tactical_target = None
@@ -1124,6 +1128,15 @@ class Bot:
                 # 兜底判据阈值：弧长标记点（70%，含 0.95 兜底）为主判据，剩余
                 # 路径长度只在车偏离轨迹导致弧长判据不可靠时兜底。
                 self.current_window_replan_remaining = WINDOW_REPLAN_TAIL_REMAINING_PX
+                # 起步段弧长阈值（方案二，动态）：随执行窗口长度变化，
+                # 长窗口起步段长、短窗口自动缩短（ALIGN 起步判定用）。
+                self.start_align_arc_px = max(
+                    START_ALIGN_ARC_MIN_PX,
+                    pr.window_target_length * START_ALIGN_WINDOW_FRACTION,
+                )
+                # 新路径 = 新起步段：重置一次性对准状态
+                self._start_aligned = False
+                self._align_started_at = None
                 self.last_path_switch_t = t
         else:
             # Do not throw away a still-useful path just because one 1 Hz OODA
@@ -1278,29 +1291,64 @@ class Bot:
             self.controller_mode = 'PATH_DONE_STOP'
             return self.stop_action()
 
-        # ---- 起步航向对准：停车起步（开局首条路径 / 窗口末端续接，车还在路径
-        # 前段且近停）时，先把车头原地转到与路径切线一致再踩油门 —— 避免车头
-        # 歪着起步走弧线（开局直冲墙角/续接跑偏）。切线取密集路径上距车最近点
-        # 的前方段（开局时最近点≈入口，等价于"入口切线"）。旋转方向按最短角：
+        # ---- 起步航向对准：车仍处于"起步段"（dense 上距起点弧长 ≤ 动态阈值）
+        # 且近停时，先把车头原地转到与路径切线一致再踩油门 —— 避免车头歪着
+        # 起步走弧线（开局直冲墙角/续接跑偏）。切线取密集路径上距车最近点的
+        # 前方段（起步段内最近点≈入口，等价于"入口切线"）。旋转方向按最短角：
         # err = wrap(切线 − 车头)，err>0 → right（角度增大=顺时针），err<0 →
         # left —— 与"车头向量×切线向量叉积"符号判定等价（自动选方便侧）。
+        # 起步段判定用"到路径起点的弧长"而不用 wp_idx：wp_idx 受路点稀疏/跳过
+        # 逻辑影响会从 1 漂到 2+（开局短路径下 ALIGN 永不触发 → 开局直冲根因）。
+        # 速度判定用位置差分（自维护上一帧位置），不用桥上报的 vx/vy —— 桥速度
+        # 是位置差分、噪声可达几百 px/s，起步瞬间就把"近停"条件破坏。
         dense = getattr(self, 'dense_path', None)
-        if (self.wp_idx <= 1 and dense and len(dense) >= 2
-                and math.hypot(me.get('vx', 0.0), me.get('vy', 0.0)) < START_ALIGN_SPEED_PX_S):
+        _spd = 0.0
+        _prev = getattr(self, '_align_prev_pos', None)
+        if _prev is not None and self._frame_dt:
+            _spd = math.hypot(me['x'] - _prev[0], me['y'] - _prev[1]) / self._frame_dt
+        self._align_prev_pos = (me['x'], me['y'])
+        if dense and len(dense) >= 2 and _spd < START_ALIGN_SPEED_PX_S:
             bx, by = me['x'], me['y']
-            bi = min(range(len(dense)), key=lambda i: (dense[i][0]-bx)**2 + (dense[i][1]-by)**2)
-            j0 = max(0, bi - 1)
-            j1 = min(len(dense) - 1, bi + 1)
-            tang = math.atan2(dense[j1][1] - dense[j0][1], dense[j1][0] - dense[j0][0])
-            err_a = wrap(tang - me['angle'])
-            if abs(err_a) > math.radians(START_ALIGN_DEG):
-                if err_a > 0:
-                    k['right'] = 1
+            # 最近点 + 该点距路径起点的弧长（单趟扫描，dense ~百点级）
+            bi = 0
+            bd = 1e18
+            arc = 0.0
+            arc_at_bi = 0.0
+            pprev = dense[0]
+            for i, p in enumerate(dense):
+                if i > 0:
+                    arc += math.hypot(p[0] - pprev[0], p[1] - pprev[1])
+                d2 = (p[0] - bx) ** 2 + (p[1] - by) ** 2
+                if d2 < bd:
+                    bd = d2
+                    bi = i
+                    arc_at_bi = arc
+                pprev = p
+            if arc_at_bi <= getattr(self, 'start_align_arc_px', START_ALIGN_ARC_MIN_PX):
+                j0 = max(0, bi - 1)
+                j1 = min(len(dense) - 1, bi + 1)
+                tang = math.atan2(dense[j1][1] - dense[j0][1], dense[j1][0] - dense[j0][0])
+                err_a = wrap(tang - me['angle'])
+                if abs(err_a) <= math.radians(START_ALIGN_DEG):
+                    # 已对准：本段路径起步对准完成，之后不再回 ALIGN
+                    self._start_aligned = True
                 else:
-                    k['left'] = 1
-                k['up'] = 0
-                self.controller_mode = 'ALIGN_START'
-                return {'keys': k, 'fire': 0}
+                    # 一次性起步对准：转 START_ALIGN_MAX_S 仍未对准 → 放弃转正，
+                    # 直接放行油门（Stanley/blocked 脱困接管），消灭无限瞎转。
+                    t_now0 = self.last_state_t or 0.0
+                    _ast = getattr(self, '_align_started_at', None)
+                    if _ast is None:
+                        _ast = t_now0
+                        self._align_started_at = t_now0
+                    if (not getattr(self, '_start_aligned', False)
+                            and (t_now0 - _ast) < START_ALIGN_MAX_S):
+                        if err_a > 0:
+                            k['right'] = 1
+                        else:
+                            k['left'] = 1
+                        k['up'] = 0
+                        self.controller_mode = 'ALIGN_START'
+                        return {'keys': k, 'fire': 0}
 
         # ---- 前方碰撞急停：车头快贴墙时松油门，避免顶墙直行 ----
         # 只松油门、不清路径、不强制重规划：路径由常规重规划自然纠正，
