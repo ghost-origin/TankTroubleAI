@@ -87,6 +87,17 @@ class ConstantVelocityKalman2D:
         identity = np.eye(4, dtype=float)
         self.covariance = (identity - gain @ h) @ self.covariance
 
+    def position_uncertainty(self) -> float:
+        """当前位置估计的不确定度 σ = √(σx²+σy²)，单位像素。
+
+        未初始化返回很大的值（视为完全不确定）。用于射击置信度的
+        C_pred 项：预测越飘，越不该打低裕度/远距离弹道。
+        """
+        if not self.initialized:
+            return 1e9
+        c = self.covariance
+        return float(np.sqrt(max(0.0, c[0, 0] + c[1, 1])))
+
     def forecast(self, horizon_s: float) -> Point:
         if not self.initialized:
             raise RuntimeError("predictor has no measurement")
