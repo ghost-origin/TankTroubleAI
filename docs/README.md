@@ -16,3 +16,5 @@
 
 保存导航参数、地图生成、Virtual Tube 和 AI 接口等参考文档。
 文档信息可能更新不及时，需要具体判断
+
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/ghost-origin/TankTroubleAI)
