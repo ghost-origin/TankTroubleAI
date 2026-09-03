@@ -29,6 +29,7 @@ from typing import Iterable, List, Optional, Sequence, Tuple
 import numpy as np
 from PIL import Image, ImageDraw
 from trajectory_refinement import refine_polyline_clearance
+from bot_config import CHASE_ALT_DETOUR_RATIO   # 次优路线长度上限（bot_config.py 调参）
 try:
     from scipy.ndimage import distance_transform_edt
 except Exception:
@@ -102,6 +103,19 @@ TACTICAL_MODE_REAR_ONLY = "rear_only"
 TACTICAL_MODE_V1 = "tactical_v1"
 TACTICAL_MODE_CHASE = "chase"
 DEFAULT_TACTICAL_MODE = TACTICAL_MODE_CHASE
+
+# ---- chase 走"第二近"路线（用户方案 A，最小改动）----
+# 每次 chase 规划：A* 最短路线 → 把最短路线两侧封锁带封掉后重跑 A* → 若存在
+# "第二近"（次优）路线且长度 ≤ 最短×CHASE_ALT_DETOUR_RATIO → 走近第二条，
+# 接触角不同（另一条走廊/房间），火控有更多锁定时机。封锁带 ≈ 走廊宽
+# （±CHASE_ALT_BLOCK_RADIUS_PX），否则 A* 只是平行并线、不是换走廊。
+# 无第二路线 / 超长 / 规划失败 → 原样走最短路线（回退无行为变化）。
+# 次优路线长度上限 CHASE_ALT_DETOUR_RATIO（=2.5）在 bot_config.py（调参集中地）
+CHASE_ALT_BLOCK_RADIUS_PX = 20.0   # 封锁带半径（最短路线两侧各半宽）
+CHASE_ALT_BLOCK_CELLS = int(round(CHASE_ALT_BLOCK_RADIUS_PX / GRID_PX))  # 4 格
+CHASE_ALT_BLOCK_MARGIN_CELLS = CHASE_ALT_BLOCK_CELLS + 1  # 首末各留 5 格（25px）
+                                    # 不封：出发/到达口袋在封锁带外，否则次优 A*
+                                    # 的起点/终点被自己的封带堵死（永远无第二路线）
 
 # Tactical V1 scores are expressed in equivalent path pixels. Rear is a reward,
 # not a reachability constraint, so a feasible flank can beat an unreachable rear.
@@ -1138,32 +1152,76 @@ def plan(me: Point, foe: Point, foe_angle: float, raw_wall: np.ndarray, blocked:
             return PlanResult(False, [], foe, None, 0, 0, ms,
                               reason="chase_no_path", tactical_mode=tactical_mode,
                               target_type="chase", path_source="chase")
-        p_cells = simplify_cells(p_cells, blocked)
-        p = [me] + [cell_to_point(c, grid_px) for c in p_cells[1:-1]] + [goal]
-        p = refine_astar_polyline(p, free_dist, raw_wall)
-        raw_path_points = len(p)
-        window = (build_execution_window(p, free_dist, raw_wall, start_heading=me_heading)
-                  if free_dist is not None else None)
-        if free_dist is None:
-            # 无距离场时退回网格路径（无足迹验证）
-            L = path_length(p)
-            return PlanResult(True, p, foe, None, L, smoothness(p), ms,
-                              reason="chase", tactical_mode=tactical_mode,
-                              target_type="chase", path_source="chase",
-                              path_validated=True, validation_reason="grid_only_no_footprint",
-                              raw_path_points=raw_path_points, executed_path_points=len(p))
+        # ---- 走"第二近"路线（用户方案 A，最小改动）----
+        # 封掉最短路线两侧封锁带后重跑 A*；存在次优路线且 ≤ 最短×比例 → 采用。
+        # 失败/超长 → 原样走最短路线（无行为变化）。
+        use_alt = False
+        alt_cells: Optional[List[Cell]] = None
+        blocked2: Optional[np.ndarray] = None
+        if len(p_cells) >= CHASE_ALT_BLOCK_MARGIN_CELLS * 2 + 1:
+            blocked2 = blocked.copy()
+            lo = CHASE_ALT_BLOCK_MARGIN_CELLS
+            hi = len(p_cells) - CHASE_ALT_BLOCK_MARGIN_CELLS
+            for c in p_cells[lo:hi]:
+                gy, gx = c[1], c[0]
+                for dy in range(-CHASE_ALT_BLOCK_CELLS, CHASE_ALT_BLOCK_CELLS + 1):
+                    y2 = gy + dy
+                    if not (0 <= y2 < blocked2.shape[0]):
+                        continue
+                    for dx in range(-CHASE_ALT_BLOCK_CELLS, CHASE_ALT_BLOCK_CELLS + 1):
+                        x2 = gx + dx
+                        if 0 <= x2 < blocked2.shape[1]:
+                            blocked2[y2, x2] = True
+            alt_cells = astar(start, foe_free, blocked2)
+            if alt_cells is not None and len(alt_cells) >= 3:
+                l1 = path_length([cell_to_point(c, grid_px) for c in p_cells])
+                l2 = path_length([cell_to_point(c, grid_px) for c in alt_cells])
+                use_alt = l2 <= l1 * CHASE_ALT_DETOUR_RATIO
+        if use_alt and alt_cells is not None:
+            direct_cells = p_cells
+            p_cells = alt_cells
+        # 候选管线：绕行优先，直连兜底。绕行路线更长、弯更多，可能过不了扫掠
+        # 校验——此时回退直连（"有绕就绕，绕不成不硬绕"），不再因为绕行校验
+        # 失败而整个计划失败（第二远策略稳定触发的关键之一）。
+        # 注意：绕行路线的 LOS 简化必须用"封锁后"网格 —— 原版 blocked 下直连
+        # 走廊仍可视，简化会把绕行拉回直连走廊（绕行被无形抹掉）。
+        src = "chase_alt" if use_alt else "chase"
+        seq = [(src, alt_cells if use_alt else p_cells,
+                (blocked2 if use_alt else None))]
+        if use_alt:
+            seq.append(("chase", direct_cells, None))
+        window = None
+        raw_points = 0
+        for src_i, cells_i, grid_i in seq:
+            cs = simplify_cells(cells_i, grid_i if grid_i is not None else blocked)
+            pp = [me] + [cell_to_point(c, grid_px) for c in cs[1:-1]] + [goal]
+            pp = refine_astar_polyline(pp, free_dist, raw_wall)
+            raw_points = len(pp)
+            win = (build_execution_window(pp, free_dist, raw_wall, start_heading=me_heading)
+                   if free_dist is not None else None)
+            if free_dist is None:
+                # 无距离场时退回网格路径（无足迹验证）
+                L = path_length(pp)
+                return PlanResult(True, pp, foe, None, L, smoothness(pp), ms,
+                                  reason="chase", tactical_mode=tactical_mode,
+                                  target_type="chase", path_source=src_i,
+                                  path_validated=True, validation_reason="grid_only_no_footprint",
+                                  raw_path_points=raw_points, executed_path_points=len(pp))
+            if win is not None:
+                window, src = win, src_i
+                break
         if window is None:
             return PlanResult(False, [], foe, None, 0, 0, ms,
                               reason="chase_tube_invalid", tactical_mode=tactical_mode,
-                              target_type="chase", path_source="chase",
-                              validation_reason="tube_invalid", raw_path_points=raw_path_points)
+                              target_type="chase", path_source=src,
+                              validation_reason="tube_invalid", raw_path_points=raw_points)
         path = window.path
         L = path_length(path)
         return PlanResult(True, path, foe, None, L, smoothness(path), ms,
                           reason="chase", tactical_mode=tactical_mode,
-                          target_type="chase", path_source="chase",
+                          target_type="chase", path_source=src,
                           path_validated=True, validation_reason=window.validation_reason,
-                          raw_path_points=raw_path_points, executed_path_points=len(path),
+                          raw_path_points=raw_points, executed_path_points=len(path),
                           global_path_length=window.global_path_length,
                           window_path_length=window.window_path_length,
                           window_target_length=window.target_length,

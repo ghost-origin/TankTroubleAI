@@ -133,6 +133,7 @@ class Bot:
         self._start_aligned = False      # 起步对准（一次性）跨轮清零
         self._align_started_at = None
         self.current_plan_reason = ''
+        self.current_path_source = None       # 当前执行路线的来源（chase / chase_alt）
         self.current_relative_deg = None
         self.current_tactical_target = None
         self.current_window_goal_reached = False
@@ -317,6 +318,7 @@ class Bot:
         self._omega_applied = None
         self.wp_idx = 0
         self.current_plan_reason = ''
+        self.current_path_source = None       # 当前执行路线的来源（chase / chase_alt）
         self.current_relative_deg = None
         self.current_tactical_target = None
         self.current_window_goal_reached = False
@@ -458,6 +460,7 @@ class Bot:
         self._start_aligned = False      # 起步对准（一次性）跨轮清零
         self._align_started_at = None
         self.current_plan_reason = ''
+        self.current_path_source = None       # 当前执行路线的来源（chase / chase_alt）
         self.current_relative_deg = None
         self.current_tactical_target = None
         self.current_window_goal_reached = False
@@ -1064,7 +1067,15 @@ class Bot:
 
                 # Similar target = harmless route refresh. Otherwise require a
                 # competitive route, or eventually release a stale path.
+                # 第二远策略（chase_alt）：目标相同（敌人在附近没跑）时——
+                #   · 当前已在走绕行 → 只接受绕行（保持接触角优势，防 0.5s 级
+                #     直连↔绕行来回切换）；
+                #   · 当前在走直连 → 允许升级为绕行（新计划换更好接触角）；
+                #   · 敌人位移超阈值（收不到 target_shift 分支）→ 绕行直接放行。
                 if target_shift <= SIMILAR_TARGET_PX:
+                    accepted = (self.current_path_source != 'chase_alt'
+                                or pr.path_source == 'chase_alt')
+                elif pr.path_source == 'chase_alt':
                     accepted = True
                 elif pr.path_length <= max(35.0, old_remaining * ratio):
                     accepted = True
@@ -1118,6 +1129,7 @@ class Bot:
                                   self.path[self.wp_idx][1] - me['y']) < WP_FIRST_MIN_PX):
                     self.wp_idx += 1
                 self.current_plan_reason = pr.reason
+                self.current_path_source = pr.path_source
                 # Hold-position results have a continuous relative angle. Keep
                 # the previous discrete tactical side as the switch preference.
                 if pr.reason != 'hold_attack_position' and pr.relative_deg is not None:
@@ -1148,6 +1160,7 @@ class Bot:
                 self._omega_applied = None
                 self.wp_idx = 0
                 self.current_plan_reason = ''
+                self.current_path_source = None       # 当前执行路线的来源（chase / chase_alt）
                 self.current_relative_deg = None
                 self.current_tactical_target = None
                 self.current_window_goal_reached = False
