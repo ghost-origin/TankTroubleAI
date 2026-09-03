@@ -22,11 +22,12 @@ from navigation_mvp import (
     A_STAR_TOPOLOGY_RADIUS_PX, DEFAULT_TACTICAL_MODE, MAP_PX,
     TACTICAL_MODE_REAR_ONLY, TACTICAL_MODE_V1, TACTICAL_MODE_CHASE,
     WINDOW_REPLAN_REMAINING_PX,
+    TANK_HALF_LENGTH_PX, TANK_HALF_WIDTH_PX,
     build_maps, load_polys, plan, swept_rectangle_path_clear,
     tank_footprint_corners,
 )
 from kalman_path_predictor import ConstantVelocityKalman2D
-from combat_ai import CombatController
+from combat_ai import CombatController, aim_beam, MUZZLE_OFFSET_PX
 
 # 全部可调参数集中在 bot_config.py（路点间距 / OODA / PID / 速度 / 旋转 / 滞回等）
 from bot_config import *   # noqa: F401,F403
@@ -34,8 +35,15 @@ from bot_config import *   # noqa: F401,F403
 CSV_COLUMNS = [
     't','me_x','me_y','me_angle','me_vx','me_vy',
     'foe_x','foe_y','foe_angle','foe_vx','foe_vy','n_bullets','n_powerups',
-    'cmd_up','cmd_down','cmd_left','cmd_right','controller_mode'
+    'cmd_up','cmd_down','cmd_left','cmd_right','controller_mode','wall'
 ]
+# 开火判定日志（每帧 combat 判定摘要，排查"为什么打/为什么不打"）
+FIRELOG_COLUMNS = ['t','round','aim_ok','aim_deg','conf','err_deg','turning',
+                   'hit','bounces','miss','self_clr',
+                   'pass_c','pass_a','pass_s','pass_d','lock','fire','why','wall',
+                   'pred_x','pred_y','foe_x','foe_y']
+# 双方子弹轨迹（每帧每颗子弹一行；owner: me/foe/? 按出生位置就近归属）
+BULLETS_COLUMNS = ['t','round','uid','x','y','vx','vy','type','owner','wall']
 PLANS_COLUMNS = [
     't','success','accepted','tactical_mode','target_type','relative_deg','target_x','target_y',
     'path_length_px','old_remaining_px','smoothness_rad','planning_ms','reason','path_points',
@@ -45,7 +53,7 @@ PLANS_COLUMNS = [
     'global_path_length_px','window_path_length_px','window_target_length_px',
     'window_lookahead_length_px','window_goal_reached',
     'prediction_horizon_s','observed_foe_x','observed_foe_y',
-    'predicted_foe_x','predicted_foe_y','predicted_foe_path'
+    'predicted_foe_x','predicted_foe_y','predicted_foe_path','wall'
 ]
 # 坐标/结构事实（非调参项）：tilemap 原点与迷宫尺寸
 MAP_ORIGIN_X = 197.5
@@ -73,10 +81,29 @@ class Bot:
         # 网页模式数据管理（对齐无头"一局一组 CSV"的思路）：
         # 固定文件名，新局直接覆盖重写（从 0 开始），bot 常驻不杀进程。
         # 外部工具只读这三个最新文件即可判断当前局信息。
-        self.round_no = 1
+        # round_no = 会话内真实局号。递增只由两个客观"新局信号"驱动：
+        #   ① 桥事件 me_respawn / layout_changed（新局 me 实例必重建）；
+        #   ② save_map 迷宫签名实际变化（每局随机迷宫不同）。
+        # 2s 防抖合并同一换局的多个信号；误触发的 finish/reset（同局爆炸位移、
+        # foe 动画误判等）不再产生新号 —— 根治"round 与局数对不上"。
+        self.round_no = 0
+        self._last_round_inc_wall = 0.0   # 上次局号递增的墙钟（防抖）
+        self._round_wall_start = None     # 本局开始的真实时间（rounds wall_start）
         self.track_path = os.path.join(out_dir, 'track.csv')
         self.maze_path = os.path.join(out_dir, 'maze.csv')
         self.plan_path = os.path.join(out_dir, 'plans.csv')
+        self.firelog_path = os.path.join(out_dir, 'firelog.csv')   # 开火判定日志
+        self.bullets_path = os.path.join(out_dir, 'bullets.csv')   # 双方子弹轨迹
+        self.ff = None          # firelog 句柄（惰性创建）
+        self.fw = None
+        self.bf = None          # bullets 句柄（惰性创建）
+        self.bw = None
+        # 逻辑子弹跟踪（游戏实例 uid 会复用，不能作跟踪键）：
+        # 跨帧最近邻匹配，给每颗"逻辑子弹"一个自增 tid。
+        self._btrack = {}        # tid -> [x, y, vx, vy, type, owner, last_t]
+        self._btrack_next = 1    # 下一个逻辑子弹 id
+        self._bullet_miss = {}   # tid -> 连续未出现帧数
+        self._bullet_t = None    # 上次跟踪帧时间（算 dt 用）
 
         # 惰性创建：第一帧到达才写文件，避免 0 行空文件噪声
         self.f = None
@@ -96,6 +123,9 @@ class Bot:
         self.visualize = False
 
         self.last_plan_t = -1e9
+        self._force_plan_accept = False
+        self._blocked_since = None       # 前方受阻开始时刻（卡死旋转脱困判定）
+        self._blocked_pos = None         # 受阻开始位置（判断是否"有进展"）
         self.path = []
         self.dense_path = []
         self.wp_idx = 0
@@ -126,6 +156,7 @@ class Bot:
         self.last_path_switch_t = -1e9
         self.client = None
         self.rows = 0
+        self._plans_flush_cnt = 0        # plans 落盘节流计数（每 4 次 replan flush 一次）
 
         self.seen_both = False
         self.round_ended = False
@@ -232,6 +263,29 @@ class Bot:
         self.lpw = csv.DictWriter(self.lpf, fieldnames=PLANS_COLUMNS)
         self.lpw.writeheader()
 
+        # 开火判定日志 / 双方子弹轨迹：**追加累积**（round 列区分局次）。
+        # 覆盖式会丢掉前几局（排查需要连续多局）；如需从零开始，删除这两个文件。
+        self.ff = None
+        self.fw = None
+        self.bf = None
+        self.bw = None
+        if IS_DATA_LOG:
+            # 调试数据（firelog/bullets）：IS_DATA_LOG=False 时全部不创建不写入
+            self.ff = open(self.firelog_path, 'a', newline='', encoding='utf-8',
+                           buffering=64 * 1024)   # 大缓冲：减少自动落盘次数
+            self.fw = csv.DictWriter(self.ff, fieldnames=FIRELOG_COLUMNS)
+            if os.path.getsize(self.firelog_path) == 0:
+                self.fw.writeheader()
+            self.bf = open(self.bullets_path, 'a', newline='', encoding='utf-8',
+                           buffering=64 * 1024)
+            self.bw = csv.DictWriter(self.bf, fieldnames=BULLETS_COLUMNS)
+            if os.path.getsize(self.bullets_path) == 0:
+                self.bw.writeheader()
+        self._btrack = {}        # 换局清空跟踪（新局子弹全为新逻辑子弹）
+        self._btrack_next = 1
+        self._bullet_miss = {}
+        self._bullet_t = None
+
         # 轮次/死亡取证数据
         self.round_t0 = None
         self.round_dist = 0.0
@@ -331,7 +385,7 @@ class Bot:
             header = ['round_id','t_end','t_start','reason','me_end_x','me_end_y','me_end_angle',
                       'foe_end_x','foe_end_y','foe_end_angle','foe_anim','me_round_dist_px',
                       'me_round_frames','me_last_speed_px_s','me_foe_los','maze_wall_count',
-                      'track_file']
+                      'track_file','round_no','wall_start','wall_end']
             new = not os.path.exists(self.round_rec_path)
             with open(self.round_rec_path, 'a', newline='', encoding='utf-8') as f:
                 w = csv.writer(f)
@@ -349,10 +403,23 @@ class Bot:
                     int(los) if los is not None else '',
                     maze_wall if maze_wall is not None else '',
                     os.path.basename(self.track_path),
+                    self.round_no,
+                    (round(self._round_wall_start, 2) if self._round_wall_start else '')
+                    if IS_DATA_LOG else '',
+                    round(time.time(), 2) if IS_DATA_LOG else '',
                 ])
         except Exception:
             import traceback
             traceback.print_exc()
+
+    def _inc_round(self):
+        """开新局号（唯一入口）。1s 防抖：同一换局链的多个信号（me_respawn +
+        maze_changed 常同帧/隔几帧到达）只算一局；真正的下一局（间隔 >1s）递增。"""
+        now = time.time()
+        if now - self._last_round_inc_wall >= 1.0:
+            self.round_no += 1
+            self._round_wall_start = now
+        self._last_round_inc_wall = now
 
     def reset_for_new_round(self, sig_reason):
         """网页模式连续对局：一轮结束后自动复位，等待下一轮开始。
@@ -361,15 +428,19 @@ class Bot:
         因为 save_map 只锁定"第一张有效迷宫"，下一局迷宫不同时会走
         maze_changed_new_round 分支重新处理（见 save_map）。
         """
+        # 注意：round_no 不在这里递增！局号只由客观新局信号（me_respawn /
+        # layout_changed / 迷宫变化）驱动，见 _inc_round。同局误触发的 reset
+        # （爆炸位移/frame gap 等假 finish）只清状态，不产生新局号。
         self.round_ended = False
         self.round_end_reason = ''
         self.seen_both = False
         self.last_state_t = None
         self.last_me_pos = None
         self.last_foe_pos = None
-        # 关键修复：跨轮复位必须清空上局地图，否则下一局会用旧迷宫规划，
-        # 产生"开局往前走、不管障碍"（旧墙不匹配新局 → 路径穿墙直行）。
-        self.maze_signature = None
+        # 关键修复：跨轮复位必须清空上局**规划缓存**（raw_wall 等），否则下一局会
+        # 用旧迷宫规划穿墙直行。但 maze_signature **保留**：save_map 用它比较新迷宫
+        # 是否变化来判定"客观新局"（round 号递增的依据）；清掉它会导致新迷宫
+        # 无法识别 → 多局共用一个 round 号（数据对不上局的根因）。
         self.raw_wall = None
         self.blocked = None
         self.blocked_turn = None
@@ -387,6 +458,8 @@ class Bot:
         self.foe_predictor = ConstantVelocityKalman2D()
         self.last_plan_t = -1e9
         self.last_path_switch_t = -1e9
+        self._blocked_since = None       # 卡死旋转状态跨轮清零
+        self._blocked_pos = None
         # 速度环状态清零：跨轮残留旧速度平滑值会延迟/错乱新局油门
         self._v_smooth = None
         self._throttle_on = False
@@ -405,8 +478,8 @@ class Bot:
         # 自动瞄准状态跨轮复位：新局清掉旧瞄准角/开火冷却
         self.combat.reset()
         self.last_bullets = []
-        # 固定文件名：新局覆盖重写（从 0 开始），bot 常驻不杀进程
-        self.round_no += 1
+        # 固定文件名：新局覆盖重写（从 0 开始），bot 常驻不杀进程。
+        # round_no 不在此递增（见 _inc_round：只由 me_respawn/迷宫变化驱动）
         self.track_path = os.path.join(self.out_dir, 'track.csv')
         self.plan_path = os.path.join(self.out_dir, 'plans.csv')
         self.maze_path = os.path.join(self.out_dir, 'maze.csv')
@@ -415,6 +488,10 @@ class Bot:
             self.pf.close()
             self.lf.close()
             self.lpf.close()
+            if self.ff is not None:
+                self.ff.close()
+            if self.bf is not None:
+                self.bf.close()
         except Exception:
             pass
         self.f = None
@@ -425,8 +502,15 @@ class Bot:
         self.lpf = None
         self.lw = None
         self.lpw = None
+        self.ff = None
+        self.fw = None
+        self.bf = None
+        self.bw = None
+        self._btrack = {}        # 换局清空跟踪（新局子弹全为新逻辑子弹）
+        self._btrack_next = 1
+        self._bullet_miss = {}
+        self._bullet_t = None
         print('== new round reset (%s): %s ==' % (sig_reason, self.track_path), flush=True)
-
     def map_coords(self, o):
         if not o:
             return None
@@ -468,18 +552,19 @@ class Bot:
             return
         sig = tuple(tuple(row) for row in maze)
 
-        if self.maze_signature is not None:
-            if sig != self.maze_signature:
-                # 迷宫变化 = 新局（无论 round_ended 与否）：
-                # 一律 reset 并重新锁图，绝不能保留旧地图继续规划
-                # （否则开局的 bot 会沿上局旧墙的路径直冲，且局数越多累积越错）。
-                self.reset_for_new_round('maze_changed')
-                self.maze_signature = None   # 强制下面重新锁图
-            else:
-                return
-        # 走到这里 = 首次锁图 或 新轮次 reset 后需要重新锁图
+        if self.maze_signature is not None and sig == self.maze_signature:
+            if self.raw_wall is not None:
+                return                       # 同迷宫且已锁：不变
+            # reset 后重锁同迷宫（同局误判恢复）：不是新局，不递增，直接重锁
+        elif self.maze_signature is not None:
+            # 迷宫实际变化 = 客观新局信号：reset 规划缓存并开新局号（防抖合并
+            # 同一次换局的事件与迷宫信号）。signature 保留到此处比较后才更新。
+            self.reset_for_new_round('maze_changed')
+            self._inc_round()
+        # 走到这里 = 首次锁图 / 新迷宫 / reset 后需重锁
 
         self.maze_signature = sig
+        self._ensure_round()   # 首局锁图时 round_no 还是 0 → 置为 1
         with open(self.maze_path, 'w', encoding='utf-8') as f:
             for row in maze:
                 f.write(','.join(map(str, row)) + '\n')
@@ -487,6 +572,14 @@ class Bot:
         with open(os.path.join(self.out_dir, 'maze_latest.csv'), 'w', encoding='utf-8') as f:
             for row in maze:
                 f.write(','.join(map(str, row)) + '\n')
+        # 按局存档：maze_roundNNN.csv（与 firelog/bullets 的 round 列对应）。
+        # 旧实现只有覆盖式 maze.csv，局结束即丢失，无法复现"模拟穿墙/假直射"。
+        # 仅 IS_DATA_LOG=True 时存档（关闭日志时省一次磁盘写）
+        if IS_DATA_LOG and self.round_no > 0:
+            arch = os.path.join(self.out_dir, 'maze_round%03d.csv' % self.round_no)
+            with open(arch, 'w', encoding='utf-8') as f:
+                for row in maze:
+                    f.write(','.join(map(str, row)) + '\n')
 
         if m.get('polys'):
             self.polys = m['polys']
@@ -501,9 +594,16 @@ class Bot:
         self.maze_written = True
         print('maze snapshot locked for this round', flush=True)
 
+    def _ensure_round(self):
+        """确保当前局号 >= 1：首局（bot 启动后第一局）锁图/首帧时 round_no 还是 0。"""
+        if self.round_no == 0:
+            self.round_no = 1
+            self._round_wall_start = time.time()
+
     def record(self, t, me, foe, msg, action):
         keys = action.get('keys') or {}
         self._open_round_files()
+        self._ensure_round()
         if self.round_t0 is None:
             self.round_t0 = t
         if self._prev_rec_pos is not None:
@@ -527,16 +627,108 @@ class Bot:
             'cmd_left':int(bool(keys.get('left'))),
             'cmd_right':int(bool(keys.get('right'))),
             'controller_mode':self.controller_mode,
+            'wall': round(time.time(), 2) if IS_DATA_LOG else '',
         }
         self.w.writerow(row)
         self.lw.writerow(row)      # 同步写"当前轮"track_latest.csv
         self.rows += 1
-        # 磁盘 I/O 节流：每 30 帧才 flush 一次（30Hz 下 ≈ 每秒 1 次）。
-        # 每帧 2 次 flush 是"偶发导航延时"的帮凶：系统磁盘忙时 flush 会
-        # 从 0.2ms 飙到几十 ms（杀软扫描/后台写盘），直接卡住单线程 bot。
-        if self.rows % 30 == 0:
+
+        # ---- 开火判定日志（每帧 combat 判定摘要，排查开火问题）----
+        fd = getattr(self.combat, 'last_firelog', None) or {}
+        if fd and self.fw is not None:
+            frow = {'t': round(t, 3), 'round': self.round_no,
+                    'wall': round(time.time(), 2) if IS_DATA_LOG else ''}
+            for k in FIRELOG_COLUMNS:
+                if k not in frow:
+                    frow[k] = fd.get(k, '')
+            self.fw.writerow(frow)
+        # ---- 双方子弹轨迹（逻辑 id 跨帧跟踪；owner 按出生位置就近归属一次）----
+        if self.bw is not None:
+            for tr in self._track_bullets(t, me, foe, msg.get('bullets') or []):
+                self.bw.writerow({
+                    't': round(t, 3), 'round': self.round_no, 'uid': 't%d' % tr['tid'],
+                    'x': round(tr['x'], 1), 'y': round(tr['y'], 1),
+                    'vx': round(tr['vx'], 1), 'vy': round(tr['vy'], 1),
+                    'type': tr['btype'], 'owner': tr['owner'],
+                    'wall': round(time.time(), 2) if IS_DATA_LOG else ''})
+
+        # 磁盘 I/O 节流：每 60 帧才 flush 一次（30Hz 下 ≈ 每 2 秒 1 次）。
+        # flush 是磁盘写：系统磁盘忙时（杀软/同步扫描大日志文件）会从 0.2ms
+        # 飙到几十 ms，直接卡住单线程 bot → 决策延迟抖动 → 转向过冲放大。
+        if self.rows % 60 == 0:
             self.f.flush()
             self.lf.flush()
+            if self.ff is not None:
+                self.ff.flush()
+            if self.bf is not None:
+                self.bf.flush()
+
+    def _track_bullets(self, t, me, foe, bl):
+        """逻辑子弹跟踪：跨帧最近邻匹配（游戏实例 uid 会复用，不能作跟踪键）。
+
+        每颗"逻辑子弹"分配自增 tid：用上一帧位置+速度外推预测本帧位置，
+        与实测位置最近邻匹配（同 type、距离 ≤ BULLET_MATCH_PX）。owner 只在
+        子弹首次出现时按出生位置就近归属 me/foe/?，之后沿用。
+        返回本帧每颗子弹的记录（tid/x/y/vx/vy/type/owner），供 bullets.csv 落盘。
+        """
+        if self._bullet_t is None:
+            self._bullet_t = t
+        dt = max(0.0, t - self._bullet_t)
+        self._bullet_t = t
+        mz_me = (me['x'] + math.cos(me['angle']) * MUZZLE_OFFSET_PX,
+                 me['y'] + math.sin(me['angle']) * MUZZLE_OFFSET_PX)
+        mz_foe = (foe['x'] + math.cos(foe['angle']) * MUZZLE_OFFSET_PX,
+                  foe['y'] + math.sin(foe['angle']) * MUZZLE_OFFSET_PX)
+        rows = []
+        used = set()
+        for b in bl:
+            try:
+                x = float(b['x']) - MAP_ORIGIN_X
+                y = float(b['y']) - MAP_ORIGIN_Y
+                vx = float(b.get('vx', 0.0))
+                vy = float(b.get('vy', 0.0))
+                btype = str(b.get('type', ''))
+            except Exception:
+                continue
+            best_tid, best_d = None, 1e18
+            for tid, st in self._btrack.items():
+                if tid in used or st[4] != btype:
+                    continue
+                px = st[0] + st[2] * dt      # 按速度外推的预测位置
+                py = st[1] + st[3] * dt
+                d = math.hypot(x - px, y - py)
+                if d < best_d:
+                    best_d, best_tid = d, tid
+            if best_tid is not None and best_d <= BULLET_MATCH_PX:
+                tid = best_tid
+                st = self._btrack[tid]
+                st[0], st[1], st[2], st[3], st[6] = x, y, vx, vy, t
+                self._bullet_miss[tid] = 0
+                owner = st[5]
+            else:
+                tid = self._btrack_next       # 新逻辑子弹
+                self._btrack_next += 1
+                d_me = math.hypot(x - mz_me[0], y - mz_me[1])
+                d_foe = math.hypot(x - mz_foe[0], y - mz_foe[1])
+                if d_me <= d_foe and d_me < 45.0:
+                    owner = 'me'
+                elif d_foe < 45.0:
+                    owner = 'foe'
+                else:
+                    owner = '?'
+                self._btrack[tid] = [x, y, vx, vy, btype, owner, t]
+                self._bullet_miss[tid] = 0
+            used.add(tid)
+            rows.append({'tid': tid, 'x': x, 'y': y, 'vx': vx, 'vy': vy,
+                         'btype': btype, 'owner': owner})
+        # 本帧未出现的已跟踪子弹：连续 BULLET_LOST_FRAMES 帧未出现才判定消失
+        for tid in list(self._btrack):
+            if tid not in used:
+                self._bullet_miss[tid] = self._bullet_miss.get(tid, 0) + 1
+                if self._bullet_miss[tid] >= BULLET_LOST_FRAMES:
+                    del self._btrack[tid]
+                    del self._bullet_miss[tid]
+        return rows
 
     def _dense_lookahead(self, me):
         """纯追踪前瞻点（备用模式）：密集路径上找距车最近的点，再沿路径前进
@@ -725,11 +917,18 @@ class Bot:
             self._last_steer_dir = d
         return d
 
-    def _debug_overlay(self):
-        """网页可视化：当前执行窗口的 path / waypoint / 车体扫掠投影（bot 坐标）。"""
+    def _debug_overlay(self, me=None):
+        """网页可视化：path / waypoint / 车体扫掠投影 + 瞄准光束预览（bot 坐标）。"""
+        beam = []
+        if IS_DATA_LOG and me is not None and self.raw_wall is not None:
+            try:
+                beam = [[round(px, 1), round(py, 1)] for px, py in
+                        aim_beam(self.raw_wall, me)]
+            except Exception:
+                beam = []
         pts = list(self.path) if self.path else []
         if not pts:
-            return {'path': [], 'waypoints': [], 'swept': []}
+            return {'path': [], 'waypoints': [], 'swept': [], 'aim_beam': beam}
         path_out = [[round(x, 1), round(y, 1)] for x, y in pts]
         # waypoint：直接画控制器实际追踪的路点（self.path 本身已按 WP_SPACING_PX 稀疏化）
         wps = [[round(x, 1), round(y, 1)] for x, y in pts]
@@ -741,7 +940,7 @@ class Bot:
             h = math.atan2(pts[j][1] - y, pts[j][0] - x)
             corners = tank_footprint_corners(x, y, h)
             swept.append([[round(cx, 1), round(cy, 1)] for cx, cy in corners])
-        return {'path': path_out, 'waypoints': wps, 'swept': swept}
+        return {'path': path_out, 'waypoints': wps, 'swept': swept, 'aim_beam': beam}
 
     def remaining_path_length(self, me):
         if not self.path or self.wp_idx >= len(self.path):
@@ -781,10 +980,16 @@ class Bot:
         active = bool(self.path and self.wp_idx < len(self.path))
         old_remaining = self.remaining_path_length(me) if active else 0.0
         accepted = False
+        # 受阻强制换路标志：必须在外层门槛之前取出并生效 —— 车头被墙卡住时
+        # 任何有效新路径都要接受（包括 40px 应急窗口），否则旧路径被钉死 → 死锁。
+        force = self._force_plan_accept
+        self._force_plan_accept = False
 
         if (pr.success and pr.path_validated and pr.path and
-                (pr.path_length >= MIN_ACCEPT_PATH_PX or pr.window_goal_reached)):
-            if not active:
+                (pr.path_length >= MIN_ACCEPT_PATH_PX or pr.window_goal_reached or force)):
+            if force:
+                accepted = True
+            elif not active:
                 accepted = True
             else:
                 # PlanResult.target remains the global tactical target while
@@ -810,7 +1015,8 @@ class Bot:
                 # 短程方向粘滞：旧路径还有一小段可走时，拒绝与当前行进方向
                 # 差 >90° 的新路径 —— 防路口等长双路 1s 级来回掉头。
                 # 状态升级(staging→attack)与超时(PATH_HOLD_MAX_S)仍放行。
-                if (active and old_remaining > PATH_SWITCH_MIN_REMAINING_PX
+                # force 时跳过：受阻必须换向，粘滞会阻止掉头导致继续顶墙。
+                if (not force and active and old_remaining > PATH_SWITCH_MIN_REMAINING_PX
                         and len(pr.path) > 1 and not staging_to_attack
                         and held < PATH_HOLD_MAX_S):
                     cur_pt = self.path[self.wp_idx] if self.wp_idx < len(self.path) else None
@@ -912,11 +1118,17 @@ class Bot:
             'predicted_foe_path':json.dumps(
                 [[round(x, 2), round(y, 2)] for x, y in predicted_path]
             ),
+            'wall': round(time.time(), 2) if IS_DATA_LOG else '',
         }
         self.pw.writerow(prow)
         self.lpw.writerow(prow)    # 同步写"当前轮"plans_latest.csv
-        self.pf.flush()
-        self.lpf.flush()
+        # plans 落盘节流：原每次 replan(0.5s) 都 flush 2 个文件；改为每 4 次
+        # （≈2s）一次，减少磁盘触碰频率（磁盘写是单线程 bot 的卡顿源）
+        self._plans_flush_cnt += 1
+        if self._plans_flush_cnt >= 4:
+            self._plans_flush_cnt = 0
+            self.pf.flush()
+            self.lpf.flush()
 
     def _spin_action(self, me):
         """原地旋转（无路线时）：方向先看我方朝向与"我方→敌方"连线的夹角 θ
@@ -942,6 +1154,36 @@ class Bot:
              'right': 1 if d == 'right' else 0}
         return {'keys': k, 'fire': 0}
 
+    def _head_clear(self, me, ahead_px=None):
+        """车头前方碰撞检测（防路径过期仍全速直行顶墙）。
+
+        沿车头朝向，在「车头前沿(半长) → 半长+ahead_px」范围内、按车体横向
+        半宽扫 5 列采样点，任一点落在墙内或出界即判定前方有墙。
+        True=安全可直行；False=前方有墙应急停。
+        """
+        raw = self.raw_wall
+        if raw is None:
+            return True
+        if ahead_px is None:
+            ahead_px = HEAD_BLOCK_AHEAD_PX
+        ca, sa = math.cos(me['angle']), math.sin(me['angle'])
+        sx, sy = -sa, ca          # 车头横向单位向量
+        h, w = raw.shape
+        hl, hw = TANK_HALF_LENGTH_PX, TANK_HALF_WIDTH_PX
+        d = hl + 2.0
+        stop = hl + ahead_px
+        while d <= stop + 1e-9:
+            for lat in (-hw, -hw * 0.5, 0.0, hw * 0.5, hw):
+                px = me['x'] + ca * d + sx * lat
+                py = me['y'] + sa * d + sy * lat
+                ix, iy = int(round(px)), int(round(py))
+                if not (0 <= ix < w and 0 <= iy < h):
+                    return False
+                if raw[iy, ix]:
+                    return False
+            d += 4.0
+        return True
+
     def action(self, me):
         k = {'up':0,'down':0,'left':0,'right':0}
         self.controller_mode = 'STOP'
@@ -963,6 +1205,33 @@ class Bot:
             # 窗口走完、新规划未到：同样原地旋转等待
             self.controller_mode = 'SPIN_NO_PATH'
             return self._spin_action(me)
+
+        # ---- 前方碰撞急停：车头快贴墙时松油门，避免顶墙直行 ----
+        # 只松油门、不清路径、不强制重规划：路径由常规重规划自然纠正，
+        # 避免频繁清路径导致可视化轨迹闪动 + 坦克愣住。
+        # 同时标记下一次重规划强制接受新路径（覆盖方向粘滞，让车能掉头绕墙）。
+        blocked_ahead = not self._head_clear(me)
+        if blocked_ahead:
+            self._force_plan_accept = True
+            # ---- 卡死脱困：持续受阻且几乎无位移 → 顺时针原地旋转找出口 ----
+            # 车头对墙时 Stanley 对（过期/朝墙的）路径输出≈0，车既不前进也不转，
+            # 会无限死锁。受阻超过 BLOCKED_ROTATE_DELAY_S 且没挪动 → 持续按右转
+            # （顺时针），车头扫过开口方向（_head_clear 变 True）后自然恢复正常。
+            t_now = self.last_state_t or 0.0
+            if self._blocked_since is None:
+                self._blocked_since = t_now
+                self._blocked_pos = (me['x'], me['y'])
+            stuck_move = math.hypot(me['x'] - self._blocked_pos[0],
+                                    me['y'] - self._blocked_pos[1])
+            if (t_now - self._blocked_since >= BLOCKED_ROTATE_DELAY_S
+                    and stuck_move <= BLOCKED_ROTATE_MOVE_PX):
+                k['right'] = 1          # 顺时针（角度增大方向 = 右转）
+                k['up'] = 0
+                self.controller_mode = 'BLOCKED_ROTATE'
+                return {'keys': k, 'fire': 0}
+        else:
+            self._blocked_since = None
+            self._blocked_pos = None
 
         # Stanley 横向控制（曲率前馈 + 航向 PD + 横向误差 atan 项）→ ω_des（rad/s）。
         # 占空比 PWM：duty = |ω_des|/3.8（转向时间占比）；ω>0 = 顺时针 = 右转。
@@ -995,10 +1264,10 @@ class Bot:
             self._v_smooth = speed_now
         else:
             self._v_smooth += SPEED_MEAS_CORR * (speed_now - self._v_smooth)
-        self._throttle_on = True
-        k['up'] = 1
+        self._throttle_on = not blocked_ahead
+        k['up'] = 0 if blocked_ahead else 1
 
-        self.controller_mode = 'FULL_SPEED_PATH'
+        self.controller_mode = 'HEAD_BLOCKED_STOP' if blocked_ahead else 'FULL_SPEED_PATH'
         return {'keys':k, 'fire':0}
 
     def on_message(self, c, text):
@@ -1061,8 +1330,11 @@ class Bot:
         evts = set(str(msg.get('event') or '').split(','))
         # 新局同步信号：me 实例 uid 变化 / 布局切换 —— 立即结束旧局、
         # 清空旧地图与路径（否则新局用旧地图旧位置规划 → 乱走）。
+        # round_no 在这里递增（客观新局信号：新局 me 实例必重建）；me_death /
+        # foe_death 等只是旧局结束，不产生新号（防 finish 误判虚增）。
         if self.seen_both and ('me_respawn' in evts or 'layout_changed' in evts or 'me_teleport' in evts):
             self.finish_round('bridge_event(new_round)')
+            self._inc_round()          # 开新局号（2s 防抖合并 maze_changed）
             c.send_text(json.dumps(self.stop_action(), separators=(',',':')))
             return
         if self.seen_both and ('me_death_anim' in evts or 'me_vanish' in evts):
@@ -1168,7 +1440,7 @@ class Bot:
             action['lock'] = 0
         if self.visualize:
             action = dict(action)
-            action['debug'] = self._debug_overlay()
+            action['debug'] = self._debug_overlay(me)
         self.record(t, me, foe, msg, action)
         c.send_text(json.dumps(action, separators=(',',':')))
 
@@ -1182,7 +1454,8 @@ class Bot:
 
     def close(self):
         for obj in (getattr(self,'f',None), getattr(self,'pf',None),
-                    getattr(self,'lf',None), getattr(self,'lpf',None)):
+                    getattr(self,'lf',None), getattr(self,'lpf',None),
+                    getattr(self,'ff',None), getattr(self,'bf',None)):
             try:
                 obj.flush()
                 obj.close()

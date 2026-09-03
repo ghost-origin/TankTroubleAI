@@ -259,7 +259,8 @@
                 }
                 lastPos['b' + b.uid] = { x: b.x, y: b.y };
                 out.bullets.push({ x: +b.x.toFixed(1), y: +b.y.toFixed(1),
-                                   vx: +vx.toFixed(1), vy: +vy.toFixed(1), type: +bt });
+                                   vx: +vx.toFixed(1), vy: +vy.toFixed(1),
+                                   type: +bt, uid: b.uid });   // uid：Python 端跟踪单颗子弹轨迹用
             }
         }
         // 道具
@@ -485,6 +486,17 @@
                 ctx2.arc(X(meInst.x - OVERLAY_ORIGIN_X), Y(meInst.y - OVERLAY_ORIGIN_Y), 4, 0, 6.2832);
                 ctx2.fill();
             }
+        }
+        // 瞄准光束预览：炮口方向弹道（含反射）前 90px，实时更新，单色
+        if (dbg.aim_beam && dbg.aim_beam.length > 1) {
+            ctx2.strokeStyle = '#00e5cc';
+            ctx2.lineWidth = 2;
+            ctx2.beginPath();
+            ctx2.moveTo(X(dbg.aim_beam[0][0]), Y(dbg.aim_beam[0][1]));
+            for (var bi = 1; bi < dbg.aim_beam.length; bi++) {
+                ctx2.lineTo(X(dbg.aim_beam[bi][0]), Y(dbg.aim_beam[bi][1]));
+            }
+            ctx2.stroke();
         }
         // waypoint（红点）
         if (dbg.waypoints && dbg.waypoints.length) {

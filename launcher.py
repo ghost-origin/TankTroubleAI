@@ -336,6 +336,18 @@ def write_round_reset(seq):
 
 
 class GameHandler(http.server.SimpleHTTPRequestHandler):
+    def __init__(self, *args, **kwargs):
+        # 浏览器刷新/关闭页面会中止正在下载的文件（WinError 10053/10054 等），
+        # 属正常现象：静默处理，避免每次刷新页面都打印一大段 traceback。
+        # 其他异常仍打印，便于排查。
+        try:
+            super().__init__(*args, **kwargs)
+        except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError):
+            pass
+        except Exception:
+            import traceback
+            traceback.print_exc()
+
     def log_message(self, format, *args):
         sys.stdout.write("[%s] %s\n" % (self.log_date_time_string(), format % args))
         sys.stdout.flush()
@@ -414,7 +426,10 @@ def main():
         try:
             _AI_PORT = find_free_port()
             if args.ai_mode == "navigation":
-                nav_log_dir = os.path.abspath(args.nav_log_dir)
+                # 每次启动建独立会话目录（时间戳），新旧数据不混淆：
+                # web_nav_logs/<启动时间>/ 下存放本轮全部 CSV；历史会话保留不动
+                sess = time.strftime("%Y%m%d_%H%M%S")
+                nav_log_dir = os.path.join(os.path.abspath(args.nav_log_dir), sess)
                 os.makedirs(nav_log_dir, exist_ok=True)
                 # 先给反馈再探测解释器（探测可能花几秒，避免看起来像死机）
                 print("  正在启动导航 AI（探测 numpy 解释器）…", flush=True)
