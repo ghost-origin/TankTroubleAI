@@ -25,9 +25,30 @@ MIN_ACCEPT_PATH_PX = 40.0               # 只接受 ≥40px 的规划路径。�
 # ---------------- OODA / 规划节奏 ----------------
 OODA_PERIOD_S = 0.50                    # 常规重规划 2Hz，减少高速时目标滞后
 LOCAL_WINDOW_RETRY_S = 0.20             # 窗口尾段续接 5Hz（原 0.05=20Hz 太重：每次
-                                        # replan 1.3ms×swept 校验，20Hz 累计 CPU 高 → 延时）
-WINDOW_REPLAN_FRACTION = 0.65           # 剩余 65% 窗口时开始预取下一段路径
+                                        # replan 1.3ms×swept 校验，20Hz 累计 CPU 高 → 延时；
+                                        # 尾段上升沿有"立即续接"补偿，5Hz 足够）
+# 窗口尾段判据（弧长标记点法）：在轨迹 WINDOW_REPLAN_FRACTION 弧长处取标记点 A，
+# 其前 WINDOW_REPLAN_REF_BACK 弧长处取参考点 B；v1 = B−A（指向轨迹后方，近似 A 点
+# 反向切线），v2 = 车中心 − A；cos(v1,v2) ≤ 0 ⟺ 夹角 ≥90° ⟺ 车已越过 A 点
+# → 进入窗口后段 → 快速续接下一段路径（越点立即续接，不等窗口耗尽停车）。
+WINDOW_REPLAN_FRACTION = 0.70           # 主标记点分数（越过此点进入窗口后段）
+WINDOW_REPLAN_REF_BACK = 0.03           # 主标记点后向参考弧长（v1 方向近似轨迹切线）
+WINDOW_REPLAN_TAIL_FRACTION = 0.95      # 兜底标记点分数：车偏离轨迹导致 0.70 主判据
+                                        # 失效（横向误差大时夹角判据失真）时，越过
+                                        # 0.95（距终点只剩 5%）必然几何触发
+WINDOW_REPLAN_TAIL_REF_BACK = 0.02      # 兜底标记点后向参考弧长（0.95 → 0.93）
+WINDOW_REPLAN_TAIL_REMAINING_PX = 45.0  # 兜底判据：剩余路径 ≤45px 也视为尾段
+                                        # （车被弹开/偏离轨迹时弧长判据不可靠）
 DEFAULT_PREDICTION_HORIZON_S = 0.0      # 敌方卡尔曼预测时域（0=关）
+
+# ---------------- 起步航向对准 ----------------
+# 停车起步（开局首条路径、窗口末端续接新路径）时：先原地旋转把车头对准路径
+# 入口切线，再踩油门 —— 避免边开边转的弧线起步（车头歪着起步会先横移一段）。
+# 旋转方向 = wrap(切线角 − 车头角)（等价于"车头向量 × 切线向量"叉积符号，自动取
+# 最短旋转方向：err>0 → 顺时针/right 键，err<0 → 逆时针/left 键，见游戏键约定）。
+# 行驶中不触发（Stanley 边走边纠）；仅车还在路径前段（wp_idx≤1）且近停时生效。
+START_ALIGN_DEG = 10.0                  # 偏差超过此角度才先转（≤10° 直接走，Stanley 可纠）
+START_ALIGN_SPEED_PX_S = 25.0           # 车速低于此值视为"停车起步"场景
 
 # ---------------- 转向控制（Stanley 横向控制器，借鉴斯坦福 DARPA 挑战赛） ----------------
 # 控制律：ω_des = FF·v·κ(s) + Kp·θe + Kd·dθe/dt − clamp(Kct·e_ct, ±CT_MAX)

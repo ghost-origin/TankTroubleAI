@@ -52,6 +52,7 @@ PLANS_COLUMNS = [
     'path_source','path_validated','validation_reason','raw_path_points','executed_path_points',
     'global_path_length_px','window_path_length_px','window_target_length_px',
     'window_lookahead_length_px','window_goal_reached',
+    'local_window_due','replan_period_s',
     'prediction_horizon_s','observed_foe_x','observed_foe_y',
     'predicted_foe_x','predicted_foe_y','predicted_foe_path','wall'
 ]
@@ -134,6 +135,7 @@ class Bot:
         self.current_tactical_target = None
         self.current_window_goal_reached = False
         self.current_window_replan_remaining = WINDOW_REPLAN_REMAINING_PX
+        self._tail_due_last = False          # 尾段上升沿记忆（进入尾段瞬间立即续接）
         self.controller_mode = 'STOP'
         self._init_accel_since = None
         self._last_steer_dir = 0
@@ -242,6 +244,7 @@ class Bot:
             os._exit(0)
 
         threading.Thread(target=loop, daemon=True).start()
+        print('parent-watch armed (ppid=%d, 5s cycle)' % os.getppid(), flush=True)
 
     def _open_round_files(self):
         """首帧到达时（惰性）创建本轮的 track/plans 文件 + "当前轮"latest 文件。"""
@@ -316,6 +319,7 @@ class Bot:
         self.current_tactical_target = None
         self.current_window_goal_reached = False
         self.current_window_replan_remaining = WINDOW_REPLAN_REMAINING_PX
+        self._tail_due_last = False          # 尾段上升沿记忆（进入尾段瞬间立即续接）
         self.me_predictor = ConstantVelocityKalman2D()
         self.foe_predictor = ConstantVelocityKalman2D()
         try:
@@ -454,6 +458,7 @@ class Bot:
         self.current_tactical_target = None
         self.current_window_goal_reached = False
         self.current_window_replan_remaining = WINDOW_REPLAN_REMAINING_PX
+        self._tail_due_last = False          # 尾段上升沿记忆（进入尾段瞬间立即续接）
         self.me_predictor = ConstantVelocityKalman2D()
         self.foe_predictor = ConstantVelocityKalman2D()
         self.last_plan_t = -1e9
@@ -948,7 +953,58 @@ class Bot:
         pts = [(me['x'], me['y'])] + list(self.path[self.wp_idx:])
         return sum(math.hypot(b[0]-a[0], b[1]-a[1]) for a,b in zip(pts, pts[1:]))
 
-    def replan(self, t, me, foe):
+    def _point_at_arc(self, dense, target_len):
+        """沿密集路径按弧长取点（线性插值）。"""
+        acc = 0.0
+        for a, b in zip(dense, dense[1:]):
+            seg = math.hypot(b[0] - a[0], b[1] - a[1])
+            if acc + seg >= target_len:
+                u = (target_len - acc) / seg if seg > 0 else 0.0
+                return (a[0] + (b[0] - a[0]) * u, a[1] + (b[1] - a[1]) * u)
+            acc += seg
+        return dense[-1]
+
+    def _past_marker_at(self, dense, total, frac, ref_back, me):
+        """单标记点判据：车是否已越过轨迹 frac 弧长标记点。
+
+        标记点 A = 轨迹 frac 弧长处；参考点 B = A 之前 ref_back 弧长处；
+        v1 = B−A（指向轨迹后方，近似 A 点反向切线）；v2 = 车中心 − A。
+        cos(v1, v2) ≤ 0 ⟺ 夹角 ≥90° ⟺ 车在 A 点之后。退化时保守返回 True。
+        """
+        ax, ay = self._point_at_arc(dense, total * frac)
+        bx, by = self._point_at_arc(dense, max(0.0, total * (frac - ref_back)))
+        v1x, v1y = bx - ax, by - ay
+        v2x, v2y = me['x'] - ax, me['y'] - ay
+        denom = math.hypot(v1x, v1y) * math.hypot(v2x, v2y)
+        if denom < 1e-9:
+            return True
+        return (v1x * v2x + v1y * v2y) / denom <= 0.0
+
+    def past_window_marker(self, me):
+        """弧长标记点判据（用户方法）：车是否已越过执行窗口轨迹的
+        WINDOW_REPLAN_FRACTION（0.70）弧长标记点。
+
+        主判据 = 70% 标记点夹角余弦 ≤0（车越过标记点 → 进入窗口后段）；
+        若车偏离轨迹导致主判据失效（横向误差大时夹角判据失真），用 0.95
+        兜底标记点 —— 车越过 0.95 弧长点（距终点只剩 5%）时几何上必然触发，
+        确保窗口末端必然进入快速续接。剩余路径长度兜底判据在调用方另做。
+        路径过短/标记点退化时保守返回 True（尽早进入快速续接）。
+        """
+        dense = self.dense_path
+        if not dense or len(dense) < 2:
+            return True
+        total = sum(math.hypot(b[0] - a[0], b[1] - a[1])
+                    for a, b in zip(dense, dense[1:]))
+        if total <= 0.0:
+            return True
+        if self._past_marker_at(dense, total,
+                                WINDOW_REPLAN_FRACTION, WINDOW_REPLAN_REF_BACK, me):
+            return True
+        return self._past_marker_at(dense, total,
+                                    WINDOW_REPLAN_TAIL_FRACTION,
+                                    WINDOW_REPLAN_TAIL_REF_BACK, me)
+
+    def replan(self, t, me, foe, local_window_due=False):
         if self.raw_wall is None or self.blocked is None or self.round_ended:
             return
 
@@ -1010,15 +1066,24 @@ class Bot:
                     accepted = True
                 elif held >= PATH_HOLD_MAX_S:
                     accepted = True
+                elif local_window_due:
+                    # 窗口尾段续接是保底动作：标记点触发后旧路径只剩 ~30%
+                    # （48px≈0.38s），新窗口（160px）必然比剩余旧路径长，
+                    # 按 ratio 比较永远被拒 → 车直走到窗口终点被迫停车。
+                    # 尾段时接受任何有效新路径（接受后新窗口从车位置开始，
+                    # 判据自然退出尾段，不会每周期换路径）。
+                    accepted = True
 
             if accepted:
                 # 短程方向粘滞：旧路径还有一小段可走时，拒绝与当前行进方向
                 # 差 >90° 的新路径 —— 防路口等长双路 1s 级来回掉头。
-                # 状态升级(staging→attack)与超时(PATH_HOLD_MAX_S)仍放行。
+                # 状态升级(staging→attack)与超时(PATH_HOLD_MAX_S)仍放行；
                 # force 时跳过：受阻必须换向，粘滞会阻止掉头导致继续顶墙。
+                # 窗口尾段续接（local_window_due）同样放行 —— 旧路径即将
+                # 耗尽，掉头去新方向是续接的必然代价。
                 if (not force and active and old_remaining > PATH_SWITCH_MIN_REMAINING_PX
                         and len(pr.path) > 1 and not staging_to_attack
-                        and held < PATH_HOLD_MAX_S):
+                        and held < PATH_HOLD_MAX_S and not local_window_due):
                     cur_pt = self.path[self.wp_idx] if self.wp_idx < len(self.path) else None
                     if cur_pt is not None:
                         cur_dir = math.atan2(cur_pt[1] - me['y'], cur_pt[0] - me['x'])
@@ -1056,10 +1121,9 @@ class Bot:
                 if pr.target is not None:
                     self.current_tactical_target = pr.target
                 self.current_window_goal_reached = pr.window_goal_reached
-                self.current_window_replan_remaining = min(
-                    WINDOW_REPLAN_REMAINING_PX,
-                    max(20.0, pr.window_target_length * WINDOW_REPLAN_FRACTION),
-                )
+                # 兜底判据阈值：弧长标记点（70%，含 0.95 兜底）为主判据，剩余
+                # 路径长度只在车偏离轨迹导致弧长判据不可靠时兜底。
+                self.current_window_replan_remaining = WINDOW_REPLAN_TAIL_REMAINING_PX
                 self.last_path_switch_t = t
         else:
             # Do not throw away a still-useful path just because one 1 Hz OODA
@@ -1110,6 +1174,8 @@ class Bot:
             'window_target_length_px':round(pr.window_target_length, 3),
             'window_lookahead_length_px':round(pr.window_lookahead_length, 3),
             'window_goal_reached':int(pr.window_goal_reached),
+            'local_window_due':int(local_window_due),
+            'replan_period_s':round(LOCAL_WINDOW_RETRY_S if local_window_due else OODA_PERIOD_S, 3),
             'prediction_horizon_s':round(self.prediction_horizon_s, 3),
             'observed_foe_x':round(foe['x'], 3),
             'observed_foe_y':round(foe['y'], 3),
@@ -1190,10 +1256,15 @@ class Bot:
         # 局间/无图保持停止；局内无合理路线才原地旋转
         if self.round_ended:
             return {'keys':k, 'fire':0}
-        if not self.path or self.wp_idx >= len(self.path):
+        if not self.path:
             # 无合理路线：原地旋转观察（每个 OODA 周期重规划，路径出现即恢复行驶）。
             self.controller_mode = 'SPIN_NO_PATH'
             return self._spin_action(me)
+        if self.wp_idx >= len(self.path):
+            # 轨迹已执行完毕（到达规划终点）：停车等待续接，不盲目前进
+            # （尾段判据会以 LOCAL_WINDOW_RETRY_S 快速续接）。
+            self.controller_mode = 'PATH_DONE_STOP'
+            return self.stop_action()
 
         while self.wp_idx < len(self.path):
             tx, ty = self.path[self.wp_idx]
@@ -1202,9 +1273,34 @@ class Bot:
             else:
                 break
         if self.wp_idx >= len(self.path):
-            # 窗口走完、新规划未到：同样原地旋转等待
-            self.controller_mode = 'SPIN_NO_PATH'
-            return self._spin_action(me)
+            # 窗口走完、新规划未到：停车等待（尾段判据以快速周期续接），
+            # 不盲目前进。replan 失败清空路径后自然转入 SPIN_NO_PATH 观察。
+            self.controller_mode = 'PATH_DONE_STOP'
+            return self.stop_action()
+
+        # ---- 起步航向对准：停车起步（开局首条路径 / 窗口末端续接，车还在路径
+        # 前段且近停）时，先把车头原地转到与路径切线一致再踩油门 —— 避免车头
+        # 歪着起步走弧线（开局直冲墙角/续接跑偏）。切线取密集路径上距车最近点
+        # 的前方段（开局时最近点≈入口，等价于"入口切线"）。旋转方向按最短角：
+        # err = wrap(切线 − 车头)，err>0 → right（角度增大=顺时针），err<0 →
+        # left —— 与"车头向量×切线向量叉积"符号判定等价（自动选方便侧）。
+        dense = getattr(self, 'dense_path', None)
+        if (self.wp_idx <= 1 and dense and len(dense) >= 2
+                and math.hypot(me.get('vx', 0.0), me.get('vy', 0.0)) < START_ALIGN_SPEED_PX_S):
+            bx, by = me['x'], me['y']
+            bi = min(range(len(dense)), key=lambda i: (dense[i][0]-bx)**2 + (dense[i][1]-by)**2)
+            j0 = max(0, bi - 1)
+            j1 = min(len(dense) - 1, bi + 1)
+            tang = math.atan2(dense[j1][1] - dense[j0][1], dense[j1][0] - dense[j0][0])
+            err_a = wrap(tang - me['angle'])
+            if abs(err_a) > math.radians(START_ALIGN_DEG):
+                if err_a > 0:
+                    k['right'] = 1
+                else:
+                    k['left'] = 1
+                k['up'] = 0
+                self.controller_mode = 'ALIGN_START'
+                return {'keys': k, 'fire': 0}
 
         # ---- 前方碰撞急停：车头快贴墙时松油门，避免顶墙直行 ----
         # 只松油门、不清路径、不强制重规划：路径由常规重规划自然纠正，
@@ -1413,11 +1509,20 @@ class Bot:
             return
 
         remaining = self.remaining_path_length(me)
+        # 窗口尾段判据：弧长标记点法为主（车越过轨迹 70% 弧长标记点，0.95
+        # 兜底），剩余路径长度兜底（车被弹开/偏离轨迹时弧长判据不可靠）。
+        past_marker = self.past_window_marker(me)
         local_window_due = (not self.current_window_goal_reached and
-                            remaining <= self.current_window_replan_remaining)
+                            (past_marker or remaining <= self.current_window_replan_remaining))
         replan_period = LOCAL_WINDOW_RETRY_S if local_window_due else OODA_PERIOD_S
         if t - self.last_plan_t >= replan_period:
-            self.replan(t, me, foe)
+            self.replan(t, me, foe, local_window_due=local_window_due)
+        elif local_window_due and not self._tail_due_last:
+            # 刚进入尾段（上升沿）：立即续接一次，不等周期 —— 标记点触发时
+            # 剩余窗口只有 (1-0.7)*160≈48px≈0.38s 行程，必须抢占这段缓冲，
+            # 否则车走到终点后新路径还没规划出来（停车等下一周期）。
+            self.replan(t, me, foe, local_window_due=True)
+        self._tail_due_last = bool(local_window_due)
         action = self.action(me)
         # ---- 自动瞄准射击判定层（独立模块，不修改上方任何导航逻辑）----
         # combat.attack() 每帧求解：从炮口出发的直瞄/反射弹道能否命中敌人
@@ -1486,4 +1591,60 @@ if __name__ == '__main__':
     bot.combat_enabled = not a.no_combat
     if bot.combat_enabled:
         print('auto-aim shooting gate ENABLED（导航 + 可行射击角时暂停导航瞄准开火）', flush=True)
+    # 孤儿进程防护：bot 通常由 launcher.py spawn（带自动重启）。launcher 被
+    # Ctrl+C 走 finally 会 terminate bot；但被直接关窗/强杀时 finally 不执行
+    # → bot 成孤儿进程一直跑（僵尸损耗资源）。bot 自监控父进程，父消失即
+    # 自杀 —— 无论 launcher 怎么死都兜底。直接命令行跑时父进程是控制台，
+    # 控制台关闭 bot 同样跟随退出（合理）。
+    try:
+        import ctypes
+        import threading as _th
+        _k32 = ctypes.windll.kernel32
+        _ppid = os.getppid()
+
+        def _watch_parent():
+            # PROCESS_QUERY_LIMITED_INFORMATION=0x1000：进程存在可打开；
+            # OpenProcess 失败时 GetLastError=5(拒绝访问)=进程存在但权限不足
+            # → 父活着；=87(参数无效)=pid 不存在 → 父已死 → 自杀。
+            while True:
+                h = _k32.OpenProcess(0x1000, False, _ppid)
+                if not h:
+                    if _k32.GetLastError() != 5:
+                        os._exit(0)
+                else:
+                    _k32.CloseHandle(h)
+                time.sleep(1.0)
+
+        _th.Thread(target=_watch_parent, daemon=True).start()
+    except Exception:
+        pass   # 非 Windows/无 ctypes：跳过监控，不影响运行
+    # 孤儿进程防护（主）：launcher.py 会在导航日志目录写 .launcher_hb 心跳文件
+    # （每秒刷新）。launcher 被关窗/强杀时 atexit/finally 都不执行 → bot 靠
+    # 心跳停更检测到 launcher 已死并自退（4 秒未更新即自杀）。Windows 的
+    # OpenProcess 父进程探测在"父→子"场景不可靠（父进程对象被滞留，终止后
+    # 长时间仍可打开）——心跳文件绕开该问题。直接命令行跑（无 launcher）时
+    # 心跳文件不存在 → 不监控、不自杀。
+    try:
+        import threading as _th2
+        # launcher 的心跳写在会话日志目录（= bot 的 out_dir）内
+        _hb = os.path.join(os.path.abspath(a.out_dir), '.launcher_hb')
+
+        def _hb_watch():
+            while True:
+                try:
+                    stale = (os.path.exists(_hb)
+                             and time.time() - os.path.getmtime(_hb) > 4.0)
+                except Exception:
+                    stale = False
+                if stale:
+                    try:
+                        print('launcher heartbeat stale, bot exiting', flush=True)
+                    except Exception:
+                        pass   # launcher 已死 → stdout 管道可能已断，忽略
+                    os._exit(0)   # 必须在 try 外：print 异常不能吞掉自杀
+                time.sleep(1.0)
+
+        _th2.Thread(target=_hb_watch, daemon=True).start()
+    except Exception:
+        pass
     bot.serve()
