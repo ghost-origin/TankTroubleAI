@@ -147,7 +147,7 @@ function diagLog(rt, ctx) {
     return { meN, foeN, total: meN + foeN };
   }
 
-  // 先等双方坦克都出现（开局过渡期可能只有一辆）
+  // 等双方坦克都出现（开局过渡期可能只有一辆）
   let seenBoth = false;
   const waitStart = Date.now();
   while (!seenBoth && Date.now() - waitStart < 30000) {
@@ -155,6 +155,42 @@ function diagLog(rt, ctx) {
     seenBoth = tankCounts().total >= 2;
   }
   if (!seenBoth) console.log('警告: 30s 内未等到双方坦克，继续运行');
+
+  // ---- 复现注入：TT_MAZE_CSV 指向迷宫 CSV（如 r56 局），注入真实 tilemap 并
+  // 把坦克挪到指定位置/朝向（TT_SPAWN_X/Y/ANG 度），敌方挪远 —— 用于固定地图评测。
+  // bot 端锁图靠"地图签名变化"自动重锁（首帧已锁旧图时注入后必触发 reset）。
+  if (process.env.TT_MAZE_CSV) {
+    try {
+      const rows = fs.readFileSync(process.env.TT_MAZE_CSV, 'utf8').trim().split('\n')
+        .map(l => l.split(',').map(v => parseInt(v, 10)));
+      const tm = rt.types_by_index[38] && rt.types_by_index[38].instances.length
+        ? rt.types_by_index[38].instances[0] : null;
+      if (tm && tm.setTileAt) {
+        for (let yy = 0; yy < 20; yy++) for (let xx = 0; xx < 30; xx++) tm.setTileAt(xx, yy, -1);
+        for (let yy = 0; yy < rows.length; yy++) {
+          for (let xx = 0; xx < rows[yy].length; xx++) tm.setTileAt(xx, yy, rows[yy][xx]);
+        }
+        console.log('[inj] maze injected rows=' + rows.length);
+      } else {
+        console.log('[inj] WARN tilemap not ready');
+      }
+      const me0 = rt.types_by_index[0] && rt.types_by_index[0].instances.length
+        ? rt.types_by_index[0].instances[0] : null;
+      if (me0) {
+        const sx = parseFloat(process.env.TT_SPAWN_X || '57');
+        const sy = parseFloat(process.env.TT_SPAWN_Y || '285');
+        const sa = parseFloat(process.env.TT_SPAWN_ANG || '195');
+        me0.x = 197.5 + sx; me0.y = 31 + sy; me0.angle = sa * Math.PI / 180;
+        console.log('[inj] me -> map(' + sx + ',' + sy + ') ang=' + sa);
+      }
+      const foeTy = rt.types_by_index[9];
+      if (foeTy && foeTy.instances.length) {
+        const fo0 = foeTy.instances[0];
+        fo0.x = 197.5 + 300; fo0.y = 31 + 300; fo0.angle = 0;
+        console.log('[inj] foe moved away');
+      }
+    } catch (e) { console.log('[inj] fail: ' + e.message); }
+  }
 
   const start = rt.kahanTime.sum;
   const SAFETY_CEIL = DURATION;   // 兜底上限 = 标准局时长（无头下游戏 60s 计时不触发）
