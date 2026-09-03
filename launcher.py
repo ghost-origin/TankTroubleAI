@@ -7,6 +7,7 @@
 - 自动打开浏览器；关闭本窗口或按 Ctrl+C 即停止
 """
 import argparse
+import atexit
 import http.server
 import json
 import os
@@ -404,6 +405,16 @@ def find_free_port():
         return s.getsockname()[1]
 
 def main():
+    # 控制台编码兜底：Windows 控制台默认 GBK，bot 输出经 pump 线程转发时若含
+    # UTF-8 替换符 \ufffd（无法用 GBK 编码）→ UnicodeEncodeError → 泵线程死 →
+    # bot stdout PIPE 无人读 → 缓冲满 → bot 卡死（"哑火/不及时"根源之一）。
+    # errors='replace' 保证任何字节都能写出去，泵线程永不崩（编码保持控制台
+    # 原生 GBK，中文不乱码）。
+    try:
+        sys.stdout.reconfigure(errors='replace')
+        sys.stderr.reconfigure(errors='replace')
+    except Exception:
+        pass
     parser = argparse.ArgumentParser(description="TankTrouble 本地网页启动器")
     parser.add_argument(
         "--ai-mode", choices=("record", "navigation", "none"), default="record",
@@ -470,6 +481,42 @@ def main():
                 import threading
                 state = {'proc': ai_proc, 'started_at': time.time()}
 
+                def _kill_children():
+                    """atexit 兜底清理：Ctrl+C 之外的所有退出路径（异常、直接
+                    关窗被强杀时 finally 不执行）也尽量终止 bot 子进程。
+                    bot 侧另有父进程监控（父消失自退）作最终兜底。"""
+                    try:
+                        st = state.get('proc')
+                        if st and st.poll() is None:
+                            st.terminate()
+                    except Exception:
+                        pass
+                    try:
+                        if ai_proc.poll() is None:
+                            ai_proc.terminate()
+                    except Exception:
+                        pass
+
+                atexit.register(_kill_children)
+
+                # 心跳文件：bot 侧的孤儿兜底依赖它 —— launcher 异常死亡（关窗/
+                # 强杀，atexit/finally 都不执行）时，bot 靠"心跳文件停止更新"
+                # 检测到 launcher 已死并自退。Windows 的 OpenProcess 父进程探测
+                # 在"父→子"场景不可靠（父进程对象被子进程引用而滞留，终止后
+                # 长时间仍可打开且退出码不更新）——心跳文件绕开该问题。
+                hb_path = os.path.join(nav_log_dir, '.launcher_hb')
+
+                def _heartbeat():
+                    while True:
+                        try:
+                            with open(hb_path, 'w') as f:
+                                f.write(str(time.time()))
+                        except Exception:
+                            pass
+                        time.sleep(1.0)
+
+                threading.Thread(target=_heartbeat, daemon=True).start()
+
                 def _spawn():
                     state['proc'] = subprocess.Popen(
                         cmd,
@@ -533,8 +580,11 @@ def main():
         print("  AI/WebSocket 服务: 未启用")
 
     # allow quick restart after Ctrl+C
-    socketserver.TCPServer.allow_reuse_address = True
-    httpd = socketserver.TCPServer(("127.0.0.1", port), GameHandler)
+    # 多线程 HTTP：单请求卡死/慢（如浏览器异常 keep-alive）不再阻塞整个游戏
+    # 服务（旧 TCPServer 单线程：一个请求挂起 → 页面全部超时打不开）。
+    # ThreadingHTTPServer.daemon_threads=True：Ctrl+C 退出不被请求线程阻塞。
+    http.server.ThreadingHTTPServer.allow_reuse_address = True
+    httpd = http.server.ThreadingHTTPServer(("127.0.0.1", port), GameHandler)
     url = "http://127.0.0.1:%d/src/tanktrouble/" % port
     print("=" * 54)
     print("  坦克动荡 3 网页版已启动")
