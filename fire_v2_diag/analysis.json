@@ -1,0 +1,118 @@
+{
+  "score_definition": {
+    "path": "map-aware A* shortest feasible distance / actual distance, ~1s windows",
+    "smooth": "heading-change radians per 100px; lower is better",
+    "safety": "hard gate: any wall overlap/collision proxy rejects match; valid match safety_score=1",
+    "distance_speed": "total_distance_px and average_speed_px_s are reported as explicit behavior metrics; speed is diagnostic and is not yet added to composite weighting",
+    "baseline": "existing_ai = 1.0"
+  },
+  "n_candidate_tracks": 3,
+  "n_valid_paired_matches": 3,
+  "n_skipped_matches": 0,
+  "skipped": [],
+  "existing_ai_baseline": {
+    "path_px": 189.93624283661111,
+    "total_distance_px": 189.93624283661111,
+    "duration_s": 2.25,
+    "average_speed_px_s": 53.762010907823516,
+    "moving_speed_px_s": 119.77386344551076,
+    "idle_ratio": 0.4512372634643378,
+    "smooth_rad_per_100px": 1.6662190708649098,
+    "map_path_efficiency": 1.0,
+    "map_efficiency_windows": 2.0,
+    "local_efficiency": 0.9512548493091509,
+    "min_clearance_px": 14.317821063276353,
+    "near_wall_8_ratio": 0.0,
+    "near_wall_12_ratio": 0.0,
+    "wall_overlap_ratio": 0.0
+  },
+  "green_navigation": {
+    "path_px": 133.6492171398607,
+    "total_distance_px": 133.6492171398607,
+    "duration_s": 2.25,
+    "average_speed_px_s": 26.903740728728213,
+    "moving_speed_px_s": 121.28676419033607,
+    "idle_ratio": 0.766816143497758,
+    "smooth_rad_per_100px": 1.2382461246699852,
+    "map_path_efficiency": 1.0,
+    "map_efficiency_windows": 2.0,
+    "local_efficiency": 0.9496708210834971,
+    "min_clearance_px": 17.11724276862369,
+    "near_wall_8_ratio": 0.0,
+    "near_wall_12_ratio": 0.0,
+    "wall_overlap_ratio": 0.0
+  },
+  "paired_relative_summary": {
+    "path_score": {
+      "median": 1.0,
+      "median_ci95": [
+        0.9717902254118871,
+        1.2969647830323279
+      ],
+      "mean": 1.0895850028147382,
+      "mean_ci95": [
+        0.9717902254118872,
+        1.2969647830323279
+      ],
+      "win_rate_gt_1": 0.3333333333333333,
+      "non_loss_rate_ge_1": 0.6666666666666666,
+      "min": 0.9717902254118871,
+      "max": 1.2969647830323279
+    },
+    "smooth_score": {
+      "median": 0.8863301364268336,
+      "median_ci95": [
+        0.6454427780438075,
+        4.9798229113954715
+      ],
+      "mean": 2.170531941955371,
+      "mean_ci95": [
+        0.6454427780438075,
+        4.9798229113954715
+      ],
+      "win_rate_gt_1": 0.3333333333333333,
+      "non_loss_rate_ge_1": 0.3333333333333333,
+      "min": 0.6454427780438075,
+      "max": 4.9798229113954715
+    },
+    "safety_score": {
+      "median": 1.0,
+      "median_ci95": [
+        1.0,
+        1.0
+      ],
+      "mean": 1.0,
+      "mean_ci95": [
+        1.0,
+        1.0
+      ],
+      "win_rate_gt_1": 0.0,
+      "non_loss_rate_ge_1": 1.0,
+      "min": 1.0,
+      "max": 1.0
+    },
+    "composite_score": {
+      "median": 0.9514573985381825,
+      "median_ci95": [
+        0.942457937538579,
+        1.7076726899458792
+      ],
+      "mean": 1.200529342007547,
+      "mean_ci95": [
+        0.942457937538579,
+        1.7076726899458794
+      ],
+      "win_rate_gt_1": 0.3333333333333333,
+      "non_loss_rate_ge_1": 0.3333333333333333,
+      "min": 0.942457937538579,
+      "max": 1.7076726899458792
+    }
+  },
+  "green_relative_to_ai": {
+    "path_score": 1.0,
+    "smooth_score": 0.8863301364268336,
+    "safety_score": 1.0,
+    "composite_score": 0.9514573985381825
+  },
+  "paired_scores_csv": "C:\\Users\\jasongeorge\\deepseek harness workspace\\dsh-session-session-ca733508-4553-436a-8a63-fdbac47d6ea1\\tanktrouble12\\fire_v2_diag\\scores_paired.csv"
+}

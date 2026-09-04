@@ -11,7 +11,7 @@ import math
 # ---------------- 调试数据记录总开关 ----------------
 # True：写 firelog/bullets/maze 按局存档/wall 时间戳等调试数据（排查用）；
 # False：关闭所有新增调试记录，只保留核心 track/plans/rounds（保证性能，减少磁盘 I/O）
-IS_DATA_LOG = False
+IS_DATA_LOG = True
 
 # ---------------- 敌方位置预测（火控提前量） ----------------
 # True：卡尔曼匀速滤波预测（只用位置观测平滑 + 隐式估计速度 + forecast 提前量；

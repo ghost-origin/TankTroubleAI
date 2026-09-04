@@ -111,6 +111,13 @@ class Bot:
         self.w = None
         self.pf = None
         self.pw = None
+        # 按局归档（每局独立、不覆盖）：track_roundNNN.csv / plans_roundNNN.csv
+        # —— 与 track.csv/plans.csv（当前局，覆盖）并存，前几局数据不丢。
+        self.f_rec = None
+        self.w_rec = None
+        self.pf_rec = None
+        self.pw_rec = None
+        self._arch_round = None       # 当前归档所属局号（幂等建文件的判据）
         self._open_round_files()
 
         self.polys = None
@@ -508,6 +515,10 @@ class Bot:
                 self.ff.close()
             if self.bf is not None:
                 self.bf.close()
+            if self.f_rec is not None:
+                self.f_rec.close()
+            if self.pf_rec is not None:
+                self.pf_rec.close()
         except Exception:
             pass
         self.f = None
@@ -518,6 +529,11 @@ class Bot:
         self.lpf = None
         self.lw = None
         self.lpw = None
+        self.f_rec = None
+        self.pf_rec = None
+        self.w_rec = None
+        self.pw_rec = None
+        self._arch_round = None       # 换局后让 _ensure_round 按新局号重开归档
         self.ff = None
         self.fw = None
         self.bf = None
@@ -615,11 +631,43 @@ class Bot:
         if self.round_no == 0:
             self.round_no = 1
             self._round_wall_start = time.time()
+        self._open_round_archive()   # 建立/续写本局"按局归档"文件（每局独立、不覆盖）
+
+    def _open_round_archive(self):
+        """为当前 round_no 建/续写 按局归档 track_roundNNN.csv / plans_roundNNN.csv。
+
+        与 track.csv（当前局，覆盖）并存，前几局完整轨迹不丢。按局号幂等：换局后
+        (round_no 变) 自动换到新文件；同局内重复调用不会重复 open。round_no<1 不建。
+        """
+        if self._arch_round == self.round_no:
+            return
+        # 切换到本局的归档文件：先关旧句柄（换局时旧局写入至此结束）
+        for h in (self.f_rec, self.pf_rec):
+            if h is not None:
+                try:
+                    h.close()
+                except Exception:
+                    pass
+        self._arch_round = self.round_no
+        self.f_rec = None
+        self.pf_rec = None
+        self.w_rec = None
+        self.pw_rec = None
+        if self.round_no < 1:
+            return
+        self.f_rec = open(os.path.join(self.out_dir, 'track_round%03d.csv' % self.round_no),
+                          'w', newline='', encoding='utf-8')
+        self.w_rec = csv.DictWriter(self.f_rec, fieldnames=CSV_COLUMNS)
+        self.w_rec.writeheader()
+        self.pf_rec = open(os.path.join(self.out_dir, 'plans_round%03d.csv' % self.round_no),
+                           'w', newline='', encoding='utf-8')
+        self.pw_rec = csv.DictWriter(self.pf_rec, fieldnames=PLANS_COLUMNS)
+        self.pw_rec.writeheader()
 
     def record(self, t, me, foe, msg, action):
         keys = action.get('keys') or {}
+        self._ensure_round()          # 先确保局号>=1，_open_round_files 才能用局号命名归档文件
         self._open_round_files()
-        self._ensure_round()
         if self.round_t0 is None:
             self.round_t0 = t
         if self._prev_rec_pos is not None:
@@ -647,6 +695,8 @@ class Bot:
         }
         self.w.writerow(row)
         self.lw.writerow(row)      # 同步写"当前轮"track_latest.csv
+        if self.w_rec is not None:
+            self.w_rec.writerow(row)   # 按局归档（不覆盖）
         self.rows += 1
 
         # ---- 开火判定日志（每帧 combat 判定摘要，排查开火问题）----
@@ -674,6 +724,8 @@ class Bot:
         if self.rows % 60 == 0:
             self.f.flush()
             self.lf.flush()
+            if self.f_rec is not None:
+                self.f_rec.flush()
             if self.ff is not None:
                 self.ff.flush()
             if self.bf is not None:
@@ -1218,6 +1270,8 @@ class Bot:
         }
         self.pw.writerow(prow)
         self.lpw.writerow(prow)    # 同步写"当前轮"plans_latest.csv
+        if self.pw_rec is not None:
+            self.pw_rec.writerow(prow)   # 按局归档（不覆盖）
         # plans 落盘节流：原每次 replan(0.5s) 都 flush 2 个文件；改为每 4 次
         # （≈2s）一次，减少磁盘触碰频率（磁盘写是单线程 bot 的卡顿源）
         self._plans_flush_cnt += 1
@@ -1225,6 +1279,8 @@ class Bot:
             self._plans_flush_cnt = 0
             self.pf.flush()
             self.lpf.flush()
+            if self.pf_rec is not None:
+                self.pf_rec.flush()
 
     def _spin_action(self, me):
         """原地旋转（无路线时）：方向先看我方朝向与"我方→敌方"连线的夹角 θ
@@ -1625,7 +1681,8 @@ class Bot:
     def close(self):
         for obj in (getattr(self,'f',None), getattr(self,'pf',None),
                     getattr(self,'lf',None), getattr(self,'lpf',None),
-                    getattr(self,'ff',None), getattr(self,'bf',None)):
+                    getattr(self,'ff',None), getattr(self,'bf',None),
+                    getattr(self,'f_rec',None), getattr(self,'pf_rec',None)):
             try:
                 obj.flush()
                 obj.close()

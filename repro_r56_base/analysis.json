@@ -1,0 +1,19 @@
+{
+  "score_definition": {
+    "path": "map-aware A* shortest feasible distance / actual distance, ~1s windows",
+    "smooth": "heading-change radians per 100px; lower is better",
+    "safety": "hard gate: any wall overlap/collision proxy rejects match; valid match safety_score=1",
+    "distance_speed": "total_distance_px and average_speed_px_s are reported as explicit behavior metrics; speed is diagnostic and is not yet added to composite weighting",
+    "baseline": "existing_ai = 1.0"
+  },
+  "n_candidate_tracks": 1,
+  "n_valid_paired_matches": 0,
+  "n_skipped_matches": 1,
+  "skipped": [
+    {
+      "file": "track_latest.csv",
+      "reason": "too_few_frames"
+    }
+  ],
+  "warning": "No valid paired matches; do not report a navigation score."
+}
